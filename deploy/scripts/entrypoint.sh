@@ -135,22 +135,13 @@ fi
 case "$RUN_TYPE" in
   cycle)
     log "=== TRADING CYCLE — Full crypto pipeline (24/7) ==="
-    PROMPT="/make-profitables-trades"
+    PROMPT="/trade"
     MAX_TURNS=35
     ;;
   review)
     log "=== PORTFOLIO REVIEW — Position management ==="
-    PROMPT="Execute portfolio review:
-1. python trading/executor.py trail-stops — auto-tighten SL for profitable positions
-2. python trading/executor.py account — get current equity
-3. python trading/executor.py positions — all open positions with PnL
-4. python trading/executor.py orders — check pending orders
-5. python trading/executor.py check-protection — verify all positions have SL/TP
-6. python trading/executor.py time-stops --max-days 10 — check expired positions
-7. Close any positions that hit time stop (>10 days)
-8. Generate review report in reports/review-${TIMESTAMP}.md
-9. Update progress.md with current state"
-    MAX_TURNS=25
+    PROMPT="Run portfolio review: source .venv/bin/activate && python trading/executor.py protect --trail --max-days 10 && python trading/executor.py status"
+    MAX_TURNS=10
     ;;
   protect)
     log "=== PROTECTION CHECK ==="
