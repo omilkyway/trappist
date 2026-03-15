@@ -12,26 +12,22 @@ RUN npm install -g @anthropic-ai/claude-code
 # Dedicated user
 RUN useradd -m -s /bin/bash trader
 
-# ── Python venv with trading deps ──
+# Python venv with trading deps
 RUN python3 -m venv /app/.venv
 RUN /app/.venv/bin/pip install --no-cache-dir \
-    "alpaca-py>=0.30.0" \
+    "ccxt>=4.4.0" \
     "python-dotenv>=1.0.0" \
     "pandas>=2.0.0" \
-    "numpy>=1.24.0"
+    "numpy>=1.24.0" \
+    "requests>=2.28.0"
 
-# ── App files ──
+# App files
 COPY --chown=trader:trader trading/ /app/trading/
 COPY --chown=trader:trader CLAUDE.md /app/CLAUDE.md
-COPY --chown=trader:trader deploy/config/.mcp.json /app/.mcp.json
-COPY --chown=trader:trader deploy/config/settings.json /home/trader/.claude/settings.json
-COPY --chown=trader:trader .claude/agents/ /app/.claude/agents/
 COPY --chown=trader:trader .claude/commands/ /app/.claude/commands/
 COPY --chown=trader:trader .claude/hooks/ /app/.claude/hooks/
+COPY --chown=trader:trader deploy/config/settings.json /home/trader/.claude/settings.json
 COPY --chown=trader:trader deploy/scripts/entrypoint.sh /app/entrypoint.sh
-
-# ── Plugins (equity-research, financial-analysis) ──
-COPY --chown=trader:trader plugins/ /app/plugins/
 
 # Ensure hooks are executable and dirs exist
 RUN chmod +x /app/entrypoint.sh \
@@ -41,7 +37,6 @@ RUN chmod +x /app/entrypoint.sh \
 USER trader
 WORKDIR /app
 
-# Make venv available
 ENV PATH="/app/.venv/bin:$PATH"
 ENV VIRTUAL_ENV="/app/.venv"
 

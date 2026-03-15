@@ -4,16 +4,8 @@
       "Bash(*)",
       "Read",
       "Write",
-      "Edit",
-      "Grep",
-      "Glob",
-      "mcp__dappier__*",
       "WebSearch"
     ],
     "deny": []
-  },
-  "env": {
-    "TRADING_MODE": "paper",
-    "ALPACA_BASE_URL": "https://paper-api.alpaca.markets"
   }
 }
