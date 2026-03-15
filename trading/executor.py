@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trade executor & data CLI — replaces MCP Alpaca tools entirely.
+"""Trade executor & data CLI for crypto futures — CCXT + Binance Futures.
 
 Usage (called by agents via Bash):
 
@@ -7,30 +7,38 @@ Usage (called by agents via Bash):
   python trading/executor.py account
   python trading/executor.py positions
   python trading/executor.py orders
-  python trading/executor.py clock
-  python trading/executor.py quote NVDA
-  python trading/executor.py quote NVDA AAPL AMD
-  python trading/executor.py bars NVDA --timeframe 1Day --days 60
-  python trading/executor.py latest-trade NVDA
-  python trading/executor.py latest-bar NVDA
-  python trading/executor.py asset NVDA
-  python trading/executor.py analyze NVDA AAPL AMD --days 60 --json
+  python trading/executor.py quote BTC/USDT:USDT
+  python trading/executor.py quote BTC/USDT:USDT ETH/USDT:USDT
+  python trading/executor.py bars BTC/USDT:USDT --timeframe 4h --limit 200
+  python trading/executor.py asset BTC/USDT:USDT
+  python trading/executor.py funding BTC/USDT:USDT
+  python trading/executor.py analyze BTC/USDT:USDT ETH/USDT:USDT --json
   python trading/executor.py status
 
   # Order placement (--side buy|sell, default buy)
-  python trading/executor.py bracket NVDA 28 185.00 166.50
-  python trading/executor.py bracket NVDA 28 185.00 166.50 --side sell
-  python trading/executor.py bracket NVDA 28 185.00 166.50 --limit 175.00
-  python trading/executor.py opg NVDA 28
-  python trading/executor.py opg NVDA 28 --side sell
-  python trading/executor.py opg NVDA 28 --limit 175.00
-  python trading/executor.py oco NVDA 28 185.00 166.50
-  python trading/executor.py oco NVDA 28 185.00 166.50 --side buy  # cover short
+  python trading/executor.py bracket BTC/USDT:USDT 0.01 95000 88000
+  python trading/executor.py bracket BTC/USDT:USDT 0.01 85000 92000 --side sell
+  python trading/executor.py bracket BTC/USDT:USDT 0.01 95000 88000 --limit 90000 --leverage 5
+  python trading/executor.py bracket BTC/USDT:USDT 0.01 95000 88000 --min-rr 1.5
 
   # Position management
-  python trading/executor.py close NVDA
-  python trading/executor.py close NVDA --pct 50
-  python trading/executor.py cancel ORDER_UUID
+  python trading/executor.py close BTC/USDT:USDT
+  python trading/executor.py cancel ORDER_ID BTC/USDT:USDT
+  python trading/executor.py cancel-all BTC/USDT:USDT
+  python trading/executor.py set-leverage BTC/USDT:USDT 10
+  python trading/executor.py set-margin BTC/USDT:USDT isolated
+
+  # Portfolio management
+  python trading/executor.py reconcile
+  python trading/executor.py check-protection
+  python trading/executor.py validate-rr BTC/USDT:USDT 90000 95000 88000 --side buy --min-rr 1.5
+  python trading/executor.py time-stops --max-days 10
+  python trading/executor.py trail-stops --dry-run
+  python trading/executor.py category BTC ETH SOL
+
+  # History
+  python trading/executor.py closed-orders --days 30
+  python trading/executor.py trades BTC/USDT:USDT --days 30
 """
 
 from __future__ import annotations
@@ -38,31 +46,38 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trading.client import (
+    OrderResult,
+    cancel_all_orders,
     cancel_order,
     close_position,
+    format_symbol,
     get_account,
-    get_asset_info,
+    get_balance,
     get_bars,
-    get_clock,
     get_closed_orders,
-    get_latest_bar,
-    get_latest_quote,
-    get_latest_trade,
+    get_funding_rate,
+    get_market_info,
     get_open_orders,
-    get_portfolio_history,
     get_positions,
+    get_ticker,
+    get_trades,
+    is_sandbox,
     place_bracket_order,
-    place_oco_order,
-    place_opg_order,
+    place_market_order,
+    place_stop_order,
+    place_tp_order,
+    set_leverage,
+    set_margin_mode,
 )
+from trading.categories import check_category_limit, get_category, normalize_symbol
 from trading.indicators import compute_signals
-from trading.sectors import check_sector_limit, get_sector
 
 
 # ---------------------------------------------------------------------------
@@ -83,25 +98,31 @@ def cmd_positions(args):
 
 def cmd_orders(args):
     """Print all open orders."""
-    print(json.dumps(get_open_orders(), indent=2))
-    return 0
-
-
-def cmd_clock(args):
-    """Print market clock."""
-    print(json.dumps(get_clock(), indent=2))
+    symbol = args.symbol if hasattr(args, "symbol") and args.symbol else None
+    print(json.dumps(get_open_orders(symbol), indent=2))
     return 0
 
 
 def cmd_quote(args):
-    """Get latest bid/ask quote for one or more symbols."""
-    if len(args.symbols) == 1:
-        print(json.dumps(get_latest_quote(args.symbols[0]), indent=2))
+    """Get ticker info for one or more symbols."""
+    symbols = [format_symbol(s) for s in args.symbols]
+    if len(symbols) == 1:
+        ticker = get_ticker(symbols[0])
+        # Also fetch funding rate
+        fr = get_funding_rate(symbols[0])
+        ticker["funding_rate"] = fr.get("funding_rate", 0)
+        ticker["funding_rate_pct"] = fr.get("funding_rate_pct", 0)
+        ticker["next_funding"] = fr.get("next_funding_time")
+        print(json.dumps(ticker, indent=2))
     else:
         results = {}
-        for sym in args.symbols:
+        for sym in symbols:
             try:
-                results[sym] = get_latest_quote(sym)
+                ticker = get_ticker(sym)
+                fr = get_funding_rate(sym)
+                ticker["funding_rate"] = fr.get("funding_rate", 0)
+                ticker["funding_rate_pct"] = fr.get("funding_rate_pct", 0)
+                results[sym] = ticker
             except Exception as e:
                 results[sym] = {"error": str(e)}
         print(json.dumps(results, indent=2))
@@ -110,50 +131,53 @@ def cmd_quote(args):
 
 def cmd_bars(args):
     """Fetch OHLCV bars as JSON."""
-    df = get_bars(args.symbol, timeframe=args.timeframe, days=args.days)
-    # Convert to list of dicts with string timestamps
+    symbol = format_symbol(args.symbol)
+    df = get_bars(symbol, timeframe=args.timeframe, limit=args.limit)
     records = []
     for ts, row in df.iterrows():
-        rec = {
+        records.append({
             "timestamp": str(ts),
-            "open": round(float(row["open"]), 4),
-            "high": round(float(row["high"]), 4),
-            "low": round(float(row["low"]), 4),
-            "close": round(float(row["close"]), 4),
-            "volume": int(row["volume"]),
-        }
-        if "vwap" in row:
-            rec["vwap"] = round(float(row["vwap"]), 4)
-        records.append(rec)
-    output = {"symbol": args.symbol, "timeframe": args.timeframe, "bars": records}
+            "open": round(float(row["open"]), 8),
+            "high": round(float(row["high"]), 8),
+            "low": round(float(row["low"]), 8),
+            "close": round(float(row["close"]), 8),
+            "volume": float(row["volume"]),
+        })
+    output = {"symbol": symbol, "timeframe": args.timeframe, "count": len(records), "bars": records}
     if args.last:
         output["bars"] = records[-args.last:]
+        output["count"] = len(output["bars"])
     print(json.dumps(output, indent=2))
     return 0
 
 
-def cmd_latest_trade(args):
-    """Get latest trade for a symbol."""
-    print(json.dumps(get_latest_trade(args.symbol), indent=2))
-    return 0
-
-
-def cmd_latest_bar(args):
-    """Get latest bar for a symbol."""
-    print(json.dumps(get_latest_bar(args.symbol), indent=2))
-    return 0
-
-
 def cmd_asset(args):
-    """Get asset info (tradability, exchange, class)."""
-    print(json.dumps(get_asset_info(args.symbol), indent=2))
+    """Get market info for a symbol."""
+    symbol = format_symbol(args.symbol)
+    print(json.dumps(get_market_info(symbol), indent=2))
+    return 0
+
+
+def cmd_funding(args):
+    """Get funding rate for one or more symbols."""
+    symbols = [format_symbol(s) for s in args.symbols]
+    if len(symbols) == 1:
+        print(json.dumps(get_funding_rate(symbols[0]), indent=2))
+    else:
+        results = {}
+        for sym in symbols:
+            try:
+                results[sym] = get_funding_rate(sym)
+            except Exception as e:
+                results[sym] = {"error": str(e)}
+        print(json.dumps(results, indent=2))
     return 0
 
 
 def cmd_status(args):
-    """Print account, positions, orders, and market clock."""
+    """Print account, positions, orders — full dashboard."""
     output = {
-        "clock": get_clock(),
+        "mode": "TESTNET" if is_sandbox() else "LIVE",
         "account": get_account(),
         "positions": get_positions(),
         "open_orders": get_open_orders(),
@@ -162,1044 +186,707 @@ def cmd_status(args):
     return 0
 
 
+def cmd_analyze(args):
+    """Run dual technical analysis on one or more symbols."""
+    symbols = [format_symbol(s) for s in args.symbols]
+    results = {}
+    for sym in symbols:
+        try:
+            df = get_bars(sym, timeframe=args.timeframe, limit=500)
+            if len(df) < 50:
+                results[sym] = {"error": f"Insufficient data: {len(df)} bars (need 50+)"}
+                continue
+            signals = compute_signals(df)
+            # Add funding rate if available
+            try:
+                fr = get_funding_rate(sym)
+                signals["funding_rate"] = fr.get("funding_rate", 0)
+                signals["funding_rate_pct"] = fr.get("funding_rate_pct", 0)
+            except Exception:
+                pass
+            # Add category
+            signals["category"] = get_category(sym)
+            results[sym] = signals
+        except Exception as e:
+            results[sym] = {"error": str(e)}
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        # Human-readable output
+        for sym, data in results.items():
+            if "error" in data:
+                print(f"\n{sym}: ERROR — {data['error']}")
+                continue
+            signals = data.get("signals", {})
+            print(f"\n{'='*50}")
+            print(f"  {sym} | {data.get('category', '?')}")
+            print(f"  Price: {data.get('price', 0):,.2f}")
+            print(f"  Long score:  {signals.get('long_score', 0)}/100 ({signals.get('long_strength', '?')})")
+            print(f"  Short score: {signals.get('short_score', 0)}/100 ({signals.get('short_strength', '?')})")
+            fr = data.get("funding_rate_pct", 0)
+            print(f"  Funding: {fr:+.4f}%")
+            ind = data.get("indicators", {})
+            print(f"  RSI: {ind.get('rsi14', 0):.1f} | ATR: {ind.get('atr14', 0):.2f}")
+            print(f"  EMA20: {ind.get('ema20', 0):,.2f} | EMA50: {ind.get('ema50', 0):,.2f} | Trend: {ind.get('ema_trend', '?')}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Order placement commands
 # ---------------------------------------------------------------------------
 
-def _check_sector_before_order(symbol: str) -> dict | None:
-    """Check sector limit before placing an order. Returns error dict or None.
+def _check_category_before_order(symbol: str) -> dict | None:
+    """Check category limit before placing an order. Returns error dict or None.
 
-    Fail-closed: if the check itself errors, BLOCK the order rather than
-    silently allowing it (learned from $2,548 sector concentration loss).
+    Fail-closed: if the check itself errors, BLOCK the order.
     """
     try:
         positions = get_positions()
         orders = get_open_orders()
-        allowed, reason = check_sector_limit(symbol, positions, orders)
+        allowed, reason = check_category_limit(symbol, positions, orders)
         if not allowed:
-            return {"success": False, "error": reason, "sector": get_sector(symbol)}
+            return {"success": False, "error": reason, "category": get_category(symbol)}
     except Exception as e:
         return {
             "success": False,
-            "error": f"Sector check failed (fail-closed): {e}",
-            "sector": get_sector(symbol),
+            "error": f"Category check failed (fail-closed): {e}",
+            "category": get_category(symbol),
         }
     return None
 
 
 def cmd_bracket(args):
-    """Place a bracket order (long or short).
+    """Place a bracket order (long or short) with SL + TP protection.
 
     When --validate is set (default), runs R/R validation with live bid/ask
-    BEFORE placing the order. This prevents Disaster 5 (gap risk).
+    BEFORE placing the order.
     """
-    sector_err = _check_sector_before_order(args.symbol)
-    if sector_err:
-        print(json.dumps(sector_err, indent=2))
+    symbol = format_symbol(args.symbol)
+    side = args.side.lower()
+
+    # Category check
+    cat_err = _check_category_before_order(symbol)
+    if cat_err:
+        print(json.dumps(cat_err, indent=2))
         return 1
 
-    # Auto-validate R/R with live prices before placement
-    if args.validate and args.limit is not None:
-        try:
-            quote = get_latest_quote(args.symbol)
-            is_short = args.side == "sell"
-            live_entry = quote["bid_price"] if is_short else quote["ask_price"]
-
-            if is_short:
-                live_reward = live_entry - args.tp
-                live_risk = args.sl - live_entry
-            else:
-                live_reward = args.tp - live_entry
-                live_risk = live_entry - args.sl
-
-            live_rr = live_reward / live_risk if live_risk > 0 else 0
-            drift_pct = abs(live_entry - args.limit) / args.limit * 100 if args.limit > 0 else 0
-
-            if live_rr < args.min_rr or live_reward <= 0 or live_risk <= 0:
-                reasons = []
-                if live_rr < args.min_rr:
-                    reasons.append(f"R/R {live_rr:.2f} < min {args.min_rr}")
-                if live_reward <= 0:
-                    reasons.append(f"negative reward ({live_reward:.2f})")
-                if live_risk <= 0:
-                    reasons.append(f"invalid risk ({live_risk:.2f})")
-                print(json.dumps({
-                    "success": False,
-                    "error": f"R/R validation FAILED: {'; '.join(reasons)}",
-                    "live_entry": live_entry,
-                    "live_rr": round(live_rr, 2),
-                    "planned_entry": args.limit,
-                    "drift_pct": round(drift_pct, 2),
-                    "bid": quote["bid_price"],
-                    "ask": quote["ask_price"],
-                }, indent=2))
+    # R/R validation if enabled (default)
+    if not args.no_validate:
+        entry = args.limit if args.limit else None
+        if not entry:
+            # Use current price for validation
+            try:
+                ticker = get_ticker(symbol)
+                entry = ticker["ask"] if side == "buy" else ticker["bid"]
+            except Exception as e:
+                print(json.dumps({"success": False, "error": f"Cannot get price for R/R validation: {e}"}, indent=2))
                 return 1
-        except Exception as e:
+
+        rr_result = _validate_rr(symbol, entry, args.tp, args.sl, side, args.min_rr)
+        if not rr_result["valid"]:
             print(json.dumps({
                 "success": False,
-                "error": f"R/R validation error (fail-closed): {e}",
+                "error": f"R/R validation FAILED: {rr_result.get('status')}",
+                "validation": rr_result,
             }, indent=2))
             return 1
 
+    # Place the order
     result = place_bracket_order(
-        symbol=args.symbol,
+        symbol=symbol,
         qty=args.qty,
-        take_profit_price=args.tp,
-        stop_loss_price=args.sl,
-        side=args.side,
-        time_in_force=args.tif,
-        limit_price=args.limit,
+        tp=args.tp,
+        sl=args.sl,
+        side=side,
+        entry_price=args.limit,
+        leverage=args.leverage,
     )
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.success else 1
 
-
-def cmd_opg(args):
-    """Place an OPG (market-on-open) order (long or short)."""
-    sector_err = _check_sector_before_order(args.symbol)
-    if sector_err:
-        print(json.dumps(sector_err, indent=2))
-        return 1
-    result = place_opg_order(
-        symbol=args.symbol,
-        qty=args.qty,
-        side=args.side,
-        limit_price=args.limit,
-    )
-    print(json.dumps(result.to_dict(), indent=2))
-    return 0 if result.success else 1
-
-
-def cmd_oco(args):
-    """Place an OCO protection order (sell to close long, buy to cover short)."""
-    result = place_oco_order(
-        symbol=args.symbol,
-        qty=args.qty,
-        take_profit_price=args.tp,
-        stop_loss_price=args.sl,
-        side=args.side,
-    )
-    print(json.dumps(result.to_dict(), indent=2))
-    return 0 if result.success else 1
-
-
-# ---------------------------------------------------------------------------
-# Position management commands
-# ---------------------------------------------------------------------------
 
 def cmd_close(args):
     """Close a position."""
-    result = close_position(args.symbol, percentage=args.pct)
+    symbol = format_symbol(args.symbol)
+
+    # Cancel related open orders first
+    try:
+        cancel_all_orders(symbol)
+    except Exception:
+        pass  # Best effort
+
+    result = close_position(symbol)
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.success else 1
 
 
 def cmd_cancel(args):
-    """Cancel an order."""
-    ok = cancel_order(args.order_id)
-    print(json.dumps({"cancelled": ok}))
-    return 0 if ok else 1
+    """Cancel an order by ID."""
+    success = cancel_order(args.order_id, format_symbol(args.symbol))
+    print(json.dumps({"success": success, "order_id": args.order_id}, indent=2))
+    return 0 if success else 1
+
+
+def cmd_cancel_all(args):
+    """Cancel all open orders for a symbol."""
+    symbol = format_symbol(args.symbol)
+    result = cancel_all_orders(symbol)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success") else 1
+
+
+def cmd_set_leverage(args):
+    """Set leverage for a symbol."""
+    symbol = format_symbol(args.symbol)
+    result = set_leverage(symbol, args.leverage)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success") else 1
+
+
+def cmd_set_margin(args):
+    """Set margin mode for a symbol."""
+    symbol = format_symbol(args.symbol)
+    result = set_margin_mode(symbol, args.mode)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success") else 1
 
 
 # ---------------------------------------------------------------------------
-# Technical analysis
+# Portfolio management commands
 # ---------------------------------------------------------------------------
 
-def cmd_analyze(args):
-    """Run technical analysis on one or more symbols."""
-    results = {}
-    for symbol in args.symbols:
-        try:
-            df = get_bars(symbol, timeframe="1Day", days=args.days)
-            signals = compute_signals(df)
+def _validate_rr(
+    symbol: str, entry: float, tp: float, sl: float,
+    side: str, min_rr: float = 1.5,
+) -> dict:
+    """Validate risk/reward ratio using live prices."""
+    try:
+        ticker = get_ticker(symbol)
+        live_bid = ticker["bid"]
+        live_ask = ticker["ask"]
+        last_price = ticker["last"]
 
-            quote = get_latest_quote(symbol)
-            signals["liquidity"] = {
-                "bid": quote["bid_price"],
-                "ask": quote["ask_price"],
-                "spread_pct": quote["spread_pct"],
-                "tradable": quote["spread_pct"] < 0.5,
-            }
+        # Testnet often returns 0 for bid/ask — fall back to last price
+        if live_ask <= 0:
+            live_ask = last_price
+        if live_bid <= 0:
+            live_bid = last_price
 
-            # Check if asset is shortable
-            try:
-                asset = get_asset_info(symbol)
-                signals["shortable"] = asset["shortable"]
-            except Exception:
-                signals["shortable"] = None
+        if side == "buy":
+            live_entry = live_ask  # buying at ask
+            live_reward = tp - live_entry
+            live_risk = live_entry - sl
+        else:
+            live_entry = live_bid  # selling at bid
+            live_reward = live_entry - tp
+            live_risk = sl - live_entry
 
-            results[symbol] = signals
-        except Exception as e:
-            results[symbol] = {"error": str(e)}
+        live_rr = round(live_reward / live_risk, 3) if live_risk > 0 else 0
+        valid = live_rr >= min_rr and live_reward > 0 and live_risk > 0
 
-    if args.json:
-        print(json.dumps(results, indent=2))
-    else:
-        for sym, data in results.items():
-            if "error" in data:
-                print(f"\n{sym}: ERROR — {data['error']}")
-                continue
-            sig = data["signals"]
-            ind = data["indicators"]
-            print(f"\n{'='*50}")
-            print(f" {sym} @ ${data['price']}")
-            print(f"{'='*50}")
-            print(f" Long Score:  {sig['long_score']}/100 ({sig['long_direction']}, {sig['long_strength']})")
-            print(f" Short Score: {sig['short_score']}/100 ({sig['short_direction']}, {sig['short_strength']})")
-            print(f" EMA20: {ind['ema20']}  EMA50: {ind['ema50']}  Trend: {ind['ema_trend']}")
-            print(f" MACD: {ind['macd_line']}  Signal: {ind['macd_signal']}  Hist: {ind['macd_histogram']}")
-            print(f" RSI(14): {ind['rsi14']}")
-            print(f" BB: [{ind['bollinger_lower']}, {ind['bollinger_middle']}, {ind['bollinger_upper']}] %B={ind['bollinger_pct_b']}")
-            print(f" ATR(14): {ind['atr14']}  Vol ratio: {ind['volume_ratio']}")
-            shortable = data.get("shortable")
-            short_str = "Yes" if shortable else ("No" if shortable is False else "?")
-            print(f" Shortable: {short_str}")
-            if data.get("liquidity"):
-                liq = data["liquidity"]
-                print(f" Spread: {liq['spread_pct']:.3f}%  Tradable: {liq['tradable']}")
-    return 0
+        rejection_reasons = []
+        if live_reward <= 0:
+            rejection_reasons.append(f"Negative reward: {live_reward:.2f}")
+        if live_risk <= 0:
+            rejection_reasons.append(f"Negative risk: {live_risk:.2f}")
+        if live_rr < min_rr:
+            rejection_reasons.append(f"R/R {live_rr:.2f} < min {min_rr}")
 
-
-# ---------------------------------------------------------------------------
-# Auto-improve commands (history & diagnostics)
-# ---------------------------------------------------------------------------
-
-def cmd_closed_orders(args):
-    """Print closed/filled orders from the last N days."""
-    print(json.dumps(get_closed_orders(days=args.days), indent=2, default=str))
-    return 0
+        return {
+            "valid": valid,
+            "status": "PASS" if valid else "FAIL",
+            "planned": {"entry": entry, "tp": tp, "sl": sl, "side": side},
+            "live": {
+                "entry": live_entry,
+                "bid": live_bid,
+                "ask": live_ask,
+                "reward": round(live_reward, 4),
+                "risk": round(live_risk, 4),
+                "rr": live_rr,
+            },
+            "min_rr": min_rr,
+            "rejection_reasons": rejection_reasons,
+        }
+    except Exception as e:
+        return {"valid": False, "status": f"ERROR: {e}", "rejection_reasons": [str(e)]}
 
 
-def cmd_portfolio_history(args):
-    """Print portfolio equity history."""
-    print(json.dumps(get_portfolio_history(days=args.days), indent=2, default=str))
-    return 0
+def cmd_validate_rr(args):
+    """Validate R/R ratio with live prices before order placement."""
+    symbol = format_symbol(args.symbol)
+    result = _validate_rr(symbol, args.entry, args.tp, args.sl, args.side, args.min_rr)
+    print(json.dumps(result, indent=2))
+    return 0 if result["valid"] else 1
 
-
-def cmd_analyze_trades(args):
-    """Run full trade performance analysis."""
-    from trading.analyzer import full_analysis
-    result = full_analysis(args.days)
-    if args.json:
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        from trading.analyzer import _print_analysis
-        _print_analysis(result)
-    return 0
-
-
-def cmd_diagnose(args):
-    """Run infrastructure diagnostics."""
-    from trading.diagnostics import run_diagnostics
-    result = run_diagnostics(args.days)
-    if args.json:
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        from trading.diagnostics import _print_diagnostics
-        _print_diagnostics(result)
-    return 0
-
-
-def cmd_collect(args):
-    """Collect data from all sources."""
-    from trading.collector import collect_all
-    result = collect_all(args.days)
-    print(json.dumps(result, indent=2, default=str))
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Reconciliation & protection checks (profit protection)
-# ---------------------------------------------------------------------------
 
 def cmd_reconcile(args):
-    """Reconcile progress.md with live Alpaca positions.
+    """Sync progress.md with live exchange state.
 
-    Prevents phantom positions from blocking trades.
-    Overwrites progress.md positions section with reality.
-    Also detects non-pipeline positions (crypto, manual trades)
-    and flags them so they don't inflate exposure calculations.
+    This is MANDATORY before every trading session to prevent phantom blocking.
     """
-    import re
-
-    # Known non-pipeline asset classes (crypto, etc.)
-    NON_PIPELINE_CLASSES = {"crypto"}
-    # Crypto symbols pattern — BTC, ETH, SOL, etc. traded as USD pairs
-    CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD", "AVAXUSD", "LINKUSD",
-                      "UNIUSD", "AAVEUSD", "DOTUSD", "MATICUSD", "SHIBUSD", "LTCUSD"}
-
-    progress_path = Path(__file__).resolve().parent.parent / "progress.md"
-    if not progress_path.exists():
-        print(json.dumps({"status": "no_progress_file", "action": "skipped"}))
-        return 0
-
-    # Get live state
     positions = get_positions()
     account = get_account()
     orders = get_open_orders()
 
-    live_symbols = {p["symbol"] for p in positions}
-
-    # Classify positions as pipeline vs non-pipeline
-    pipeline_positions = []
-    non_pipeline_positions = []
-    for p in positions:
-        sym = p["symbol"]
-        asset_class = p.get("asset_class", "").lower()
-        is_crypto = asset_class in NON_PIPELINE_CLASSES or sym in CRYPTO_SYMBOLS
-        if is_crypto:
-            non_pipeline_positions.append(p)
-        else:
-            pipeline_positions.append(p)
-
-    # Calculate exposure only from pipeline positions
     equity = account["equity"]
-    pipeline_exposure = sum(
-        abs(p["market_value"]) for p in pipeline_positions
-    ) / equity * 100 if equity > 0 else 0
-    total_exposure = sum(
-        abs(p["market_value"]) for p in positions
-    ) / equity * 100 if equity > 0 else 0
+    exposure = account["total_exposure"]
+    exposure_pct = account["exposure_pct"]
 
-    # Read progress.md and check for stale position references
-    content = progress_path.read_text()
+    # Read current progress.md if it exists
+    progress_path = Path("progress.md")
+    stale_symbols = []
 
-    # Extract symbols mentioned in position tables
-    stale_symbols = set()
-    for match in re.finditer(r"\|\s*([A-Z]{1,5})\s*\|.*\|\s*(LONG|SHORT)\s*\|", content):
-        sym = match.group(1)
-        if sym not in live_symbols and sym not in ("Symbol", "Ticker"):
-            stale_symbols.add(sym)
+    if progress_path.exists():
+        content = progress_path.read_text()
+        # Simple check: if progress mentions positions that don't exist live
+        for line in content.split("\n"):
+            if "|" in line and "USDT" in line:
+                parts = [p.strip() for p in line.split("|")]
+                for part in parts:
+                    if "USDT" in part and "/" in part:
+                        # This looks like a symbol
+                        sym = part.strip()
+                        live_syms = {p["symbol"] for p in positions}
+                        if sym and sym not in live_syms and sym not in ["/USDT:USDT"]:
+                            stale_symbols.append(sym)
 
-    # Rebuild the positions section (pipeline only in main table)
-    pos_lines = []
-    if pipeline_positions:
-        pos_lines.append("| Symbol | Qty | Side | Entry Price | Current Price | Unrealized P&L | P&L % |")
-        pos_lines.append("|--------|-----|------|------------|--------------|----------------|-------|")
-        for p in pipeline_positions:
-            side = "LONG" if "LONG" in p["side"].upper() else "SHORT"
-            plpc = p["unrealized_plpc"] * 100
-            pos_lines.append(
-                f"| {p['symbol']} | {int(abs(p['qty']))} | {side} | "
-                f"${p['avg_entry_price']:.2f} | ${p['current_price']:.2f} | "
-                f"${p['unrealized_pl']:.2f} | {plpc:+.2f}% |"
+    # Build new progress.md
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        f"# TRAPPIST Portfolio State",
+        f"",
+        f"> Last reconciled: {now}",
+        f"> Mode: {'TESTNET' if is_sandbox() else 'LIVE'}",
+        f"",
+        f"## Account",
+        f"- Equity: {equity:,.2f} USDT",
+        f"- Free: {account['free']:,.2f} USDT",
+        f"- Exposure: {exposure:,.2f} USDT ({exposure_pct:.1f}%)",
+        f"- Positions: {len(positions)}",
+        f"- Open orders: {len(orders)}",
+        f"",
+    ]
+
+    if positions:
+        lines.extend([
+            f"## Open Positions",
+            f"| Symbol | Side | Size | Entry | Mark | PnL | PnL% | Leverage |",
+            f"|--------|------|------|-------|------|-----|------|----------|",
+        ])
+        for p in positions:
+            pnl_sign = "+" if p["unrealized_pnl"] >= 0 else ""
+            lines.append(
+                f"| {p['symbol']} | {p['side']} | {p['contracts']} | "
+                f"{p['entry_price']:,.2f} | {p['mark_price']:,.2f} | "
+                f"{pnl_sign}{p['unrealized_pnl']:,.4f} | {pnl_sign}{p['pnl_pct']:.2f}% | "
+                f"{p['leverage']}x |"
             )
-    else:
-        pos_lines.append("None.")
+        lines.append("")
 
-    # Add non-pipeline section if any exist
-    if non_pipeline_positions:
-        pos_lines.append("")
-        pos_lines.append("**Non-pipeline positions (excluded from exposure calc):**")
-        for p in non_pipeline_positions:
-            side = "LONG" if "LONG" in p["side"].upper() else "SHORT"
-            pos_lines.append(
-                f"- {p['symbol']} {side} {int(abs(p['qty']))} @ ${p['avg_entry_price']:.2f} "
-                f"(P&L: ${p['unrealized_pl']:.2f})"
+    if orders:
+        lines.extend([
+            f"## Open Orders",
+            f"| Symbol | Side | Type | Amount | Price | Stop | Status |",
+            f"|--------|------|------|--------|-------|------|--------|",
+        ])
+        for o in orders:
+            lines.append(
+                f"| {o['symbol']} | {o['side']} | {o['type']} | "
+                f"{o['amount']} | {o['price']} | {o['stop_price']} | {o['status']} |"
             )
+        lines.append("")
 
-    needs_update = stale_symbols or non_pipeline_positions or pipeline_positions
-
-    if needs_update:
-        # Replace the Open Positions section
-        new_section = "## Open Positions\n\n" + "\n".join(pos_lines)
-        content = re.sub(
-            r"## Open Positions\n\n.*?(?=\n## |\Z)",
-            new_section + "\n\n",
-            content,
-            flags=re.DOTALL,
-        )
-
-        # Update account section
-        cash = account["cash"]
-        buying_power = account["buying_power"]
-        content = re.sub(
-            r"\| Equity \| \$[\d,.]+ \|",
-            f"| Equity | ${equity:,.2f} |",
-            content,
-        )
-        content = re.sub(
-            r"\| Buying Power \| \$[\d,.]+ \|",
-            f"| Buying Power | ${buying_power:,.2f} |",
-            content,
-        )
-        content = re.sub(
-            r"\| Cash \| \$[\d,.]+ \|",
-            f"| Cash | ${cash:,.2f} |",
-            content,
-        )
-        progress_path.write_text(content)
+    progress_path.write_text("\n".join(lines))
 
     result = {
-        "status": "reconciled" if needs_update else "in_sync",
-        "stale_symbols_removed": sorted(stale_symbols),
-        "pipeline_positions": [p["symbol"] for p in pipeline_positions],
-        "non_pipeline_positions": [p["symbol"] for p in non_pipeline_positions],
-        "pipeline_exposure_pct": round(pipeline_exposure, 2),
-        "total_exposure_pct": round(total_exposure, 2),
-        "action": "progress.md updated" if needs_update else "none",
+        "status": "reconciled",
+        "equity": equity,
+        "exposure_pct": exposure_pct,
+        "positions": len(positions),
+        "open_orders": len(orders),
+        "stale_symbols_removed": stale_symbols,
+        "mode": "TESTNET" if is_sandbox() else "LIVE",
     }
-    if non_pipeline_positions:
-        result["warning"] = (
-            f"Found {len(non_pipeline_positions)} non-pipeline position(s) "
-            f"({', '.join(p['symbol'] for p in non_pipeline_positions)}). "
-            f"Excluded from pipeline exposure ({pipeline_exposure:.1f}% vs {total_exposure:.1f}% total)."
-        )
     print(json.dumps(result, indent=2))
     return 0
 
 
 def cmd_check_protection(args):
-    """Check if all open positions have OCO/bracket protection orders.
-
-    Returns unprotected positions that need OCO orders placed.
-    This is critical for profit protection — no naked positions allowed.
-    """
+    """Verify all positions have SL/TP orders (protection check)."""
     positions = get_positions()
-    orders = get_open_orders()
-
     if not positions:
-        print(json.dumps({"status": "no_positions", "unprotected": []}))
+        result = {"status": "no_positions", "protected": 0, "unprotected": []}
+        print(json.dumps(result, indent=2))
         return 0
 
-    # Build set of symbols that have protection (OCO legs or bracket legs)
-    protected_symbols = set()
-    partial_protection: dict[str, set] = {}  # symbol -> set of order types
-    for order in orders:
-        sym = order["symbol"]
-        order_class = order.get("order_class", "").lower()
-        # Full protection: OCO or bracket order class
-        # Alpaca returns "OrderClass.OCO" — use substring match
-        if "oco" in order_class or "bracket" in order_class:
-            protected_symbols.add(sym)
-        if order.get("legs"):
-            protected_symbols.add(sym)
-        # Track standalone stop/limit orders as partial protection
-        order_type = order.get("type", "").lower()
-        if order_type in ("stop", "stop_limit"):
-            partial_protection.setdefault(sym, set()).add("stop")
-        elif order_type == "limit":
-            partial_protection.setdefault(sym, set()).add("limit")
-    # Standalone stop + limit pair = effective protection
-    for sym, types in partial_protection.items():
-        if "stop" in types and "limit" in types:
-            protected_symbols.add(sym)
+    all_orders = get_open_orders()
 
+    protected = []
     unprotected = []
+
     for pos in positions:
-        if pos["symbol"] not in protected_symbols:
-            side = "LONG" if "LONG" in pos["side"].upper() else "SHORT"
+        sym = pos["symbol"]
+        side = pos["side"]
+        has_sl = False
+        has_tp = False
+
+        for order in all_orders:
+            if order["symbol"] != sym or not order.get("reduce_only", False):
+                continue
+            order_type = order["type"].upper()
+            if "STOP" in order_type:
+                has_sl = True
+            if "TAKE_PROFIT" in order_type or "PROFIT" in order_type:
+                has_tp = True
+
+        if has_sl and has_tp:
+            protected.append(sym)
+        else:
             unprotected.append({
-                "symbol": pos["symbol"],
-                "qty": int(abs(pos["qty"])),
+                "symbol": sym,
                 "side": side,
-                "entry_price": pos["avg_entry_price"],
-                "current_price": pos["current_price"],
-                "unrealized_pl": pos["unrealized_pl"],
-                "oco_side": "sell" if side == "LONG" else "buy",
+                "contracts": pos["contracts"],
+                "entry_price": pos["entry_price"],
+                "mark_price": pos["mark_price"],
+                "unrealized_pnl": pos["unrealized_pnl"],
+                "has_sl": has_sl,
+                "has_tp": has_tp,
+                "required_close_side": "sell" if side == "long" else "buy",
             })
 
     status = "all_protected" if not unprotected else "UNPROTECTED_POSITIONS"
-    print(json.dumps({
+    result = {
         "status": status,
-        "total_positions": len(positions),
-        "protected": len(positions) - len(unprotected),
+        "protected_count": len(protected),
+        "protected": protected,
+        "unprotected_count": len(unprotected),
         "unprotected": unprotected,
-    }, indent=2))
-    return 0 if not unprotected else 1
-
-
-# ---------------------------------------------------------------------------
-# Fill watcher — polls for OPG fills and auto-places OCO
-# ---------------------------------------------------------------------------
-
-def cmd_watch_fills(args):
-    """Poll for OPG fills and auto-place OCO protection orders.
-
-    Reads pending_protections.json, waits for positions to appear,
-    then places OCO immediately on fill. Replaces the timing-dependent
-    protector.py cron by running right after market open.
-    """
-    import time as _time
-    from trading.protector import load_protections, save_protections, has_oco_for_symbol, find_position
-
-    protections = load_protections(args.file)
-    if not protections:
-        print(json.dumps({"status": "no_pending_protections", "action": "none"}))
-        return 0
-
-    print(json.dumps({
-        "status": "watching",
-        "pending": len(protections),
-        "timeout_s": args.timeout,
-        "interval_s": args.interval,
-    }))
-
-    completed = []
-    remaining = list(protections)
-    start = _time.time()
-
-    while remaining and (_time.time() - start) < args.timeout:
-        positions = get_positions()
-        orders = get_open_orders()
-        still_pending = []
-
-        for prot in remaining:
-            symbol = prot["symbol"]
-
-            if has_oco_for_symbol(symbol, orders):
-                prot["oco_status"] = "already_exists"
-                completed.append(prot)
-                continue
-
-            pos = find_position(symbol, positions)
-            if pos is None:
-                still_pending.append(prot)
-                continue
-
-            # Position filled — place OCO immediately
-            actual_qty = abs(int(float(pos["qty"])))
-            result = place_oco_order(
-                symbol=symbol,
-                qty=actual_qty,
-                take_profit_price=prot["tp"],
-                stop_loss_price=prot["sl"],
-                side=prot["oco_side"],
-            )
-
-            if result.success:
-                prot["oco_order_id"] = result.order_id
-                prot["oco_status"] = "placed"
-                print(json.dumps({"event": "oco_placed", "symbol": symbol,
-                                  "order_id": result.order_id, "qty": actual_qty}))
-            else:
-                prot["oco_status"] = "error"
-                prot["oco_error"] = result.error
-                print(json.dumps({"event": "oco_failed", "symbol": symbol,
-                                  "error": result.error}))
-            completed.append(prot)
-
-        remaining = still_pending
-        if remaining:
-            _time.sleep(args.interval)
-
-    # Save only remaining (unfilled) items
-    save_protections(args.file, remaining)
-
-    report = {
-        "completed": len(completed),
-        "remaining": len(remaining),
-        "details": {p["symbol"]: p.get("oco_status", "timeout") for p in completed},
-        "still_pending": [p["symbol"] for p in remaining],
-        "elapsed_s": round(_time.time() - start, 1),
     }
-    print(json.dumps(report, indent=2))
-    return 0 if not remaining else 1
+    print(json.dumps(result, indent=2))
+    return 1 if unprotected else 0
 
-
-# ---------------------------------------------------------------------------
-# Trailing stops — adjusts SL for profitable positions
-# ---------------------------------------------------------------------------
-
-def cmd_trail_stops(args):
-    """Adjust stop-losses for positions that have moved in our favor.
-
-    Logic:
-    - If position P&L >= breakeven_pct: move SL to breakeven (entry price)
-    - If position P&L >= breakeven_pct + trail_pct: trail SL at current - trail_pct
-    - Only adjusts existing OCO orders (cancels old, places new)
-    """
-    positions = get_positions()
-    orders = get_open_orders()
-
-    if not positions:
-        print(json.dumps({"status": "no_positions"}))
-        return 0
-
-    adjustments = []
-
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry = pos["avg_entry_price"]
-        current = pos["current_price"]
-        qty = abs(int(float(pos["qty"])))
-        is_long = "LONG" in pos["side"].upper()
-        pnl_pct = pos["unrealized_plpc"] * 100
-
-        # Find existing OCO for this position
-        existing_oco = None
-        for order in orders:
-            if order["symbol"] != symbol:
-                continue
-            oc = order.get("order_class", "")
-            if "OCO" in oc.upper() or order.get("legs"):
-                existing_oco = order
-                break
-
-        if existing_oco is None:
-            continue  # No OCO to adjust
-
-        # Extract current SL and TP from legs
-        current_sl = None
-        current_tp = None
-        for leg in existing_oco.get("legs", []):
-            if leg.get("stop_price"):
-                current_sl = float(leg["stop_price"])
-            if leg.get("limit_price"):
-                current_tp = float(leg["limit_price"])
-
-        # Also check parent order
-        if current_tp is None and existing_oco.get("limit_price"):
-            current_tp = float(existing_oco["limit_price"])
-
-        if current_sl is None:
-            continue
-
-        # Calculate new SL
-        new_sl = current_sl
-        reason = None
-
-        if is_long:
-            if pnl_pct >= args.breakeven_pct:
-                # At minimum, SL at breakeven
-                breakeven_sl = round(entry * 1.001, 2)  # tiny buffer above entry
-                if current_sl < breakeven_sl:
-                    new_sl = breakeven_sl
-                    reason = f"breakeven (P&L {pnl_pct:+.1f}% >= {args.breakeven_pct}%)"
-
-                # Trail: SL at current - trail_pct
-                trail_sl = round(current * (1 - args.trail_pct / 100), 2)
-                if trail_sl > new_sl:
-                    new_sl = trail_sl
-                    reason = f"trailing {args.trail_pct}% below ${current:.2f}"
-        else:
-            # SHORT: SL is above entry, lower = better
-            if pnl_pct >= args.breakeven_pct:
-                breakeven_sl = round(entry * 0.999, 2)
-                if current_sl > breakeven_sl:
-                    new_sl = breakeven_sl
-                    reason = f"breakeven (P&L {pnl_pct:+.1f}% >= {args.breakeven_pct}%)"
-
-                trail_sl = round(current * (1 + args.trail_pct / 100), 2)
-                if trail_sl < new_sl:
-                    new_sl = trail_sl
-                    reason = f"trailing {args.trail_pct}% above ${current:.2f}"
-
-        if new_sl == current_sl or reason is None:
-            continue
-
-        adjustment = {
-            "symbol": symbol,
-            "side": "LONG" if is_long else "SHORT",
-            "entry": entry,
-            "current": current,
-            "pnl_pct": round(pnl_pct, 2),
-            "old_sl": current_sl,
-            "new_sl": new_sl,
-            "tp": current_tp,
-            "reason": reason,
-        }
-
-        if args.dry_run:
-            adjustment["action"] = "DRY_RUN"
-            adjustments.append(adjustment)
-            continue
-
-        # Cancel old OCO and place new one
-        cancel_ok = cancel_order(existing_oco["id"])
-        if not cancel_ok:
-            adjustment["action"] = "CANCEL_FAILED"
-            adjustments.append(adjustment)
-            continue
-
-        # Place new OCO with adjusted SL
-        oco_side = "sell" if is_long else "buy"
-        tp = current_tp if current_tp else (
-            round(entry * 1.10, 2) if is_long else round(entry * 0.90, 2)
-        )
-        result = place_oco_order(
-            symbol=symbol,
-            qty=qty,
-            take_profit_price=tp,
-            stop_loss_price=new_sl,
-            side=oco_side,
-        )
-
-        if result.success:
-            adjustment["action"] = "ADJUSTED"
-            adjustment["new_order_id"] = result.order_id
-        else:
-            # RACE CONDITION FIX: Old OCO cancelled but new one failed.
-            # Position is now NAKED. Attempt to restore original protection.
-            restore = place_oco_order(
-                symbol=symbol,
-                qty=qty,
-                take_profit_price=tp,
-                stop_loss_price=current_sl,  # restore ORIGINAL SL
-                side=oco_side,
-            )
-            if restore.success:
-                adjustment["action"] = "REPLACE_FAILED_RESTORED"
-                adjustment["restored_order_id"] = restore.order_id
-                adjustment["original_error"] = result.error
-            else:
-                adjustment["action"] = "REPLACE_FAILED_NAKED"
-                adjustment["error"] = (
-                    f"New OCO failed: {result.error}. "
-                    f"Restore also failed: {restore.error}. "
-                    f"POSITION IS UNPROTECTED — manual intervention needed."
-                )
-
-        adjustments.append(adjustment)
-
-    print(json.dumps({
-        "status": "done",
-        "dry_run": args.dry_run,
-        "adjustments": adjustments,
-        "positions_checked": len(positions),
-    }, indent=2))
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Time stops — enforce max holding period
-# ---------------------------------------------------------------------------
 
 def cmd_time_stops(args):
-    """Identify positions held longer than max_days for forced exit.
-
-    Enforces the 10-day time stop rule from CLAUDE.md.
-    Fail-closed: if created_at is missing or unparseable, flag the position.
-    """
-    from datetime import datetime as _dt, timezone as _tz
-
+    """Check positions held longer than max-days (time stop enforcement)."""
     positions = get_positions()
     if not positions:
-        print(json.dumps({"status": "no_positions", "expired": []}))
+        print(json.dumps({"status": "no_positions", "expired": [], "active": []}, indent=2))
         return 0
 
-    now = _dt.now(_tz.utc)
+    max_days = args.max_days
+    now = datetime.now(timezone.utc)
     expired = []
     active = []
 
     for pos in positions:
-        symbol = pos["symbol"]
-        side = "LONG" if "LONG" in pos.get("side", "").upper() else "SHORT"
-        qty = int(abs(float(pos.get("qty", 0))))
-        created_str = pos.get("created_at", "")
-
-        if not created_str:
-            expired.append({
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "days_held": None,
-                "reason": "no created_at — cannot determine age, flagged for review",
-            })
+        ts = pos.get("timestamp")
+        if not ts:
+            # Can't determine age — flag for review
+            expired.append({**pos, "days_held": "unknown", "reason": "no timestamp — flag for review"})
             continue
 
         try:
-            created = _dt.fromisoformat(created_str.replace("Z", "+00:00"))
-            days_held = (now - created).days
-        except (ValueError, TypeError):
-            days_held = args.max_days + 1  # fail-closed
+            opened = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+            days_held = (now - opened).days
+        except Exception:
+            expired.append({**pos, "days_held": "parse_error", "reason": "timestamp parse failed"})
+            continue
 
-        info = {
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "days_held": days_held,
-            "entry_price": pos.get("avg_entry_price"),
-            "current_price": pos.get("current_price"),
-            "unrealized_pl": pos.get("unrealized_pl"),
-        }
-
-        if days_held >= args.max_days:
-            info["reason"] = f"held {days_held} days >= {args.max_days} max"
-            expired.append(info)
+        entry = {**pos, "days_held": days_held}
+        if days_held > max_days:
+            entry["reason"] = f"held {days_held} days > max {max_days}"
+            expired.append(entry)
         else:
-            info["days_remaining"] = args.max_days - days_held
-            active.append(info)
+            active.append(entry)
 
     status = "EXPIRED_POSITIONS" if expired else "all_within_limits"
-    print(json.dumps({
-        "status": status,
-        "max_days": args.max_days,
-        "expired": expired,
-        "active": active,
-    }, indent=2))
-    return 0 if not expired else 1
+    print(json.dumps({"status": status, "max_days": max_days, "expired": expired, "active": active}, indent=2))
+    return 1 if expired else 0
 
 
-# ---------------------------------------------------------------------------
-# R/R validation — re-check with live bid/ask before order placement
-# ---------------------------------------------------------------------------
+def cmd_trail_stops(args):
+    """Adjust stop-losses for profitable positions (trailing stop)."""
+    positions = get_positions()
+    orders = get_open_orders()
+    adjustments = []
 
-def cmd_validate_rr(args):
-    """Validate risk/reward ratio using live bid/ask prices.
+    breakeven_pct = args.breakeven_pct
+    trail_pct = args.trail_pct
 
-    Prevents Disaster 5 (OPG gap risk): planned R/R can collapse
-    when actual execution price differs from analysis-time price.
-    Must be run BEFORE placing any order.
-    """
-    symbol = args.symbol
-    entry = args.entry
-    tp = args.tp
-    sl = args.sl
-    is_short = args.side == "sell"
-    min_rr = args.min_rr
+    for pos in positions:
+        sym = pos["symbol"]
+        side = pos["side"]
+        entry = pos["entry_price"]
+        current = pos["mark_price"]
+        pnl_pct = pos["pnl_pct"]
+        contracts = pos["contracts"]
 
-    # Get live quote
-    try:
-        quote = get_latest_quote(symbol)
-    except Exception as e:
-        print(json.dumps({
-            "valid": False,
-            "symbol": symbol,
-            "error": f"Cannot get live quote: {e}",
-        }, indent=2))
-        return 1
+        # Find current SL order
+        current_sl = None
+        sl_order_id = None
+        for o in orders:
+            if o["symbol"] == sym and o.get("reduce_only") and "STOP" in o["type"].upper():
+                current_sl = o["stop_price"]
+                sl_order_id = o["id"]
+                break
 
-    # Determine realistic entry based on side
-    if is_short:
-        live_entry = quote["bid_price"]  # shorts enter at bid
-        reward = entry - tp if tp < entry else 0  # planned reward
-        risk = sl - entry if sl > entry else 0  # planned risk
-        live_reward = live_entry - tp
-        live_risk = sl - live_entry
-    else:
-        live_entry = quote["ask_price"]  # longs enter at ask
-        reward = tp - entry if tp > entry else 0
-        risk = entry - sl if sl < entry else 0
-        live_reward = tp - live_entry
-        live_risk = live_entry - sl
+        if not current_sl:
+            adjustments.append({
+                "symbol": sym, "action": "SKIP",
+                "reason": "no existing SL order found",
+            })
+            continue
 
-    # Calculate R/R ratios
-    planned_rr = reward / risk if risk > 0 else 0
-    live_rr = live_reward / live_risk if live_risk > 0 else 0
+        new_sl = None
+        reason = ""
 
-    # Entry drift from planned
-    drift_pct = abs(live_entry - entry) / entry * 100 if entry > 0 else 0
+        if side == "long":
+            if pnl_pct >= breakeven_pct + trail_pct:
+                # Trail: SL at current - trail_pct%
+                new_sl = round(current * (1 - trail_pct / 100), 2)
+                reason = f"trailing ({pnl_pct:.1f}% profit)"
+            elif pnl_pct >= breakeven_pct:
+                # Move SL to breakeven
+                new_sl = entry
+                reason = f"breakeven ({pnl_pct:.1f}% profit)"
 
-    valid = live_rr >= min_rr and live_reward > 0 and live_risk > 0
-    status = "PASS" if valid else "FAIL"
+            # Only move SL up, never down
+            if new_sl and new_sl <= current_sl:
+                new_sl = None
+                reason = "new SL would be lower than current"
+        else:  # short
+            if pnl_pct >= breakeven_pct + trail_pct:
+                new_sl = round(current * (1 + trail_pct / 100), 2)
+                reason = f"trailing ({pnl_pct:.1f}% profit)"
+            elif pnl_pct >= breakeven_pct:
+                new_sl = entry
+                reason = f"breakeven ({pnl_pct:.1f}% profit)"
 
-    result = {
-        "valid": valid,
-        "status": status,
-        "symbol": symbol,
-        "side": "SHORT" if is_short else "LONG",
-        "planned": {
+            # Only move SL down (tighter) for shorts
+            if new_sl and new_sl >= current_sl:
+                new_sl = None
+                reason = "new SL would be higher than current"
+
+        if new_sl and not args.dry_run:
+            # Cancel old SL and place new one
+            close_side = "sell" if side == "long" else "buy"
+            cancel_ok = cancel_order(sl_order_id, sym)
+            if cancel_ok:
+                sl_result = place_stop_order(sym, contracts, new_sl, side=close_side)
+                action = "ADJUSTED" if sl_result.success else "FAILED"
+            else:
+                action = "CANCEL_FAILED"
+        elif new_sl:
+            action = "WOULD_ADJUST (dry-run)"
+        else:
+            action = "NO_CHANGE"
+
+        adjustments.append({
+            "symbol": sym,
+            "side": side,
             "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "rr": round(planned_rr, 2),
-        },
-        "live": {
-            "bid": quote["bid_price"],
-            "ask": quote["ask_price"],
-            "spread_pct": quote["spread_pct"],
-            "effective_entry": live_entry,
-            "rr": round(live_rr, 2),
-            "reward": round(live_reward, 2),
-            "risk": round(live_risk, 2),
-        },
-        "drift_pct": round(drift_pct, 2),
-        "min_rr": min_rr,
-    }
+            "current": current,
+            "pnl_pct": pnl_pct,
+            "old_sl": current_sl,
+            "new_sl": new_sl,
+            "action": action,
+            "reason": reason,
+        })
 
-    if not valid:
-        reasons = []
-        if live_rr < min_rr:
-            reasons.append(f"R/R {live_rr:.2f} < min {min_rr}")
-        if live_reward <= 0:
-            reasons.append(f"negative reward ({live_reward:.2f})")
-        if live_risk <= 0:
-            reasons.append(f"invalid risk ({live_risk:.2f})")
-        if drift_pct > 2:
-            reasons.append(f"entry drift {drift_pct:.1f}% from plan")
-        result["rejection_reasons"] = reasons
-
-    print(json.dumps(result, indent=2))
-    return 0 if valid else 1
+    print(json.dumps({"adjustments": adjustments, "dry_run": args.dry_run}, indent=2))
+    return 0
 
 
-# ---------------------------------------------------------------------------
-# Sector lookup
-# ---------------------------------------------------------------------------
-
-def cmd_sector(args):
-    """Show GICS sector for one or more symbols."""
+def cmd_category(args):
+    """Look up crypto categories for symbols."""
     results = {}
     for sym in args.symbols:
-        sector = get_sector(sym)
-        results[sym] = sector
+        base = normalize_symbol(sym)
+        results[base] = get_category(sym)
     print(json.dumps(results, indent=2))
     return 0
 
 
 # ---------------------------------------------------------------------------
-# CLI parser
+# History commands
 # ---------------------------------------------------------------------------
 
-def main():
+def cmd_closed_orders(args):
+    """Show closed/filled orders."""
+    symbol = format_symbol(args.symbol) if args.symbol else None
+    orders = get_closed_orders(symbol, days=args.days)
+    print(json.dumps({"count": len(orders), "orders": orders}, indent=2))
+    return 0
+
+
+def cmd_trades(args):
+    """Show trade history (fills) for a symbol."""
+    symbol = format_symbol(args.symbol)
+    trades = get_trades(symbol, days=args.days)
+    print(json.dumps({"count": len(trades), "trades": trades}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Claude Trading CLI — all Alpaca operations via alpaca-py SDK"
+        description="TRAPPIST — Crypto Futures Trade Executor CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", help="Available commands")
 
     # --- Data queries ---
+    sub.add_parser("account", help="Account balance and equity")
+    sub.add_parser("positions", help="Open positions with PnL")
 
-    p = sub.add_parser("account", help="Show account info (equity, buying power)")
-    p.set_defaults(func=cmd_account)
+    p = sub.add_parser("orders", help="Open orders")
+    p.add_argument("symbol", nargs="?", default=None, help="Filter by symbol")
 
-    p = sub.add_parser("positions", help="Show all open positions")
-    p.set_defaults(func=cmd_positions)
+    p = sub.add_parser("quote", help="Current ticker + funding rate")
+    p.add_argument("symbols", nargs="+", help="Symbols (BTC, ETH, BTC/USDT:USDT)")
 
-    p = sub.add_parser("orders", help="Show all open orders")
-    p.set_defaults(func=cmd_orders)
+    p = sub.add_parser("bars", help="OHLCV candle data")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("--timeframe", "-t", default="4h",
+                   choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
+                   help="Timeframe (default: 4h)")
+    p.add_argument("--limit", "-n", type=int, default=500, help="Number of candles")
+    p.add_argument("--last", type=int, default=0, help="Show only last N bars")
 
-    p = sub.add_parser("clock", help="Show market clock (open/close times)")
-    p.set_defaults(func=cmd_clock)
+    p = sub.add_parser("asset", help="Market info (precision, limits, fees)")
+    p.add_argument("symbol", help="Symbol")
 
-    p = sub.add_parser("quote", help="Get latest bid/ask quote")
-    p.add_argument("symbols", nargs="+", help="Ticker symbol(s)")
-    p.set_defaults(func=cmd_quote)
+    p = sub.add_parser("funding", help="Current funding rate")
+    p.add_argument("symbols", nargs="+", help="Symbols")
 
-    p = sub.add_parser("bars", help="Fetch OHLCV bars")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("--timeframe", default="1Day", choices=["1Min", "5Min", "15Min", "1Hour", "1Day", "1Week"])
-    p.add_argument("--days", type=int, default=60, help="Days of history (default 60)")
-    p.add_argument("--last", type=int, default=None, help="Only show last N bars")
-    p.set_defaults(func=cmd_bars)
+    sub.add_parser("status", help="Full dashboard (account + positions + orders)")
 
-    p = sub.add_parser("latest-trade", help="Get latest trade for a symbol")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.set_defaults(func=cmd_latest_trade)
-
-    p = sub.add_parser("latest-bar", help="Get latest bar for a symbol")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.set_defaults(func=cmd_latest_bar)
-
-    p = sub.add_parser("asset", help="Get asset info (tradability, exchange)")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.set_defaults(func=cmd_asset)
-
-    p = sub.add_parser("status", help="Show account, positions, orders, clock")
-    p.set_defaults(func=cmd_status)
+    p = sub.add_parser("analyze", help="Dual technical analysis (long + short scores)")
+    p.add_argument("symbols", nargs="+", help="Symbols to analyze")
+    p.add_argument("--timeframe", "-t", default="4h", help="Timeframe for analysis")
+    p.add_argument("--json", action="store_true", help="JSON output")
 
     # --- Order placement ---
-
-    p = sub.add_parser("bracket", help="Place bracket order (entry + TP + SL)")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("qty", type=int, help="Number of shares")
+    p = sub.add_parser("bracket", help="Bracket order (entry + SL + TP)")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("qty", type=float, help="Position size in base currency")
     p.add_argument("tp", type=float, help="Take-profit price")
     p.add_argument("sl", type=float, help="Stop-loss price")
-    p.add_argument("--side", default="buy", choices=["buy", "sell"], help="buy=long, sell=short (default: buy)")
-    p.add_argument("--limit", type=float, default=None, help="Limit entry price (STRONGLY recommended)")
-    p.add_argument("--tif", default="gtc", choices=["day", "gtc"], help="Time-in-force (default: gtc)")
-    p.add_argument("--no-validate", dest="validate", action="store_false", help="Skip R/R validation (NOT recommended)")
-    p.add_argument("--min-rr", type=float, default=1.5, help="Min R/R for validation (default 1.5, use 1.3 for VIX>28)")
-    p.set_defaults(func=cmd_bracket, validate=True)
+    p.add_argument("--side", default="buy", choices=["buy", "sell"],
+                   help="buy=LONG, sell=SHORT (default: buy)")
+    p.add_argument("--limit", type=float, default=None, help="Limit entry price (None=market)")
+    p.add_argument("--leverage", type=int, default=5, help="Leverage (default: 5)")
+    p.add_argument("--min-rr", type=float, default=1.5, help="Minimum R/R ratio (default: 1.5)")
+    p.add_argument("--no-validate", action="store_true",
+                   help="Skip R/R validation (NOT recommended)")
 
-    p = sub.add_parser("opg", help="Place OPG (market-on-open) order")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("qty", type=int, help="Number of shares")
-    p.add_argument("--side", default="buy", choices=["buy", "sell"], help="buy=long, sell=short (default: buy)")
-    p.add_argument("--limit", type=float, default=None, help="Limit price for LOO")
-    p.set_defaults(func=cmd_opg)
-
-    p = sub.add_parser("oco", help="Place OCO protection order")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("qty", type=int, help="Number of shares")
-    p.add_argument("tp", type=float, help="Take-profit price")
-    p.add_argument("sl", type=float, help="Stop-loss price")
-    p.add_argument("--side", default="sell", choices=["buy", "sell"], help="sell=close long, buy=cover short (default: sell)")
-    p.set_defaults(func=cmd_oco)
-
-    # --- Position management ---
-
-    p = sub.add_parser("close", help="Close a position (long or short)")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("--pct", type=float, default=None, help="Partial close percentage")
-    p.set_defaults(func=cmd_close)
+    p = sub.add_parser("close", help="Close a position")
+    p.add_argument("symbol", help="Symbol")
 
     p = sub.add_parser("cancel", help="Cancel an order")
-    p.add_argument("order_id", help="Order UUID")
-    p.set_defaults(func=cmd_cancel)
+    p.add_argument("order_id", help="Order ID")
+    p.add_argument("symbol", help="Symbol")
 
-    # --- Technical analysis ---
+    p = sub.add_parser("cancel-all", help="Cancel all orders for a symbol")
+    p.add_argument("symbol", help="Symbol")
 
-    p = sub.add_parser("analyze", help="Technical analysis on symbol(s)")
-    p.add_argument("symbols", nargs="+", help="Ticker symbol(s)")
-    p.add_argument("--days", type=int, default=60, help="Days of history (default 60)")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.set_defaults(func=cmd_analyze)
+    p = sub.add_parser("set-leverage", help="Set leverage")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("leverage", type=int, help="Leverage multiplier")
 
-    # --- Auto-improve (history & diagnostics) ---
+    p = sub.add_parser("set-margin", help="Set margin mode")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("mode", choices=["isolated", "cross"], help="Margin mode")
 
-    p = sub.add_parser("closed-orders", help="Show closed orders (last N days)")
-    p.add_argument("--days", type=int, default=30, help="Lookback period (default 30)")
-    p.set_defaults(func=cmd_closed_orders)
+    # --- Portfolio management ---
+    sub.add_parser("reconcile", help="Sync progress.md with live state (MANDATORY before trading)")
 
-    p = sub.add_parser("portfolio-history", help="Show portfolio equity history")
-    p.add_argument("--days", type=int, default=30, help="Lookback period (default 30)")
-    p.set_defaults(func=cmd_portfolio_history)
+    sub.add_parser("check-protection", help="Verify all positions have SL/TP orders")
 
-    p = sub.add_parser("analyze-trades", help="Full trade performance analysis")
-    p.add_argument("--days", type=int, default=30, help="Lookback period (default 30)")
-    p.add_argument("--json", action="store_true", help="JSON output")
-    p.set_defaults(func=cmd_analyze_trades)
-
-    p = sub.add_parser("diagnose", help="Infrastructure diagnostics")
-    p.add_argument("--days", type=int, default=30, help="Lookback period (default 30)")
-    p.add_argument("--json", action="store_true", help="JSON output")
-    p.set_defaults(func=cmd_diagnose)
-
-    p = sub.add_parser("collect", help="Collect data from all sources (Scaleway + Alpaca + reports)")
-    p.add_argument("--days", type=int, default=30, help="Lookback period (default 30)")
-    p.set_defaults(func=cmd_collect)
-
-    # --- Reconciliation & protection ---
-
-    p = sub.add_parser("reconcile", help="Reconcile progress.md with live Alpaca positions")
-    p.set_defaults(func=cmd_reconcile)
-
-    p = sub.add_parser("check-protection", help="Check all positions have SL/TP protection")
-    p.set_defaults(func=cmd_check_protection)
-
-    p = sub.add_parser("watch-fills", help="Poll for OPG fills and auto-place OCO protection")
-    p.add_argument("--file", default="pending_protections.json", help="Pending protections JSON")
-    p.add_argument("--timeout", type=int, default=300, help="Max seconds to poll (default 300)")
-    p.add_argument("--interval", type=int, default=15, help="Poll interval in seconds (default 15)")
-    p.set_defaults(func=cmd_watch_fills)
-
-    p = sub.add_parser("trail-stops", help="Adjust stop-losses for profitable positions")
-    p.add_argument("--breakeven-pct", type=float, default=3.0, help="Move SL to breakeven at this %% gain (default 3.0)")
-    p.add_argument("--trail-pct", type=float, default=2.0, help="Trail SL this %% below high watermark after breakeven-pct (default 2.0)")
-    p.add_argument("--dry-run", action="store_true", help="Show what would change without modifying orders")
-    p.set_defaults(func=cmd_trail_stops)
-
-    p = sub.add_parser("time-stops", help="Check positions held > N days (time stop rule)")
-    p.add_argument("--max-days", type=int, default=10, help="Max trading days to hold (default 10)")
-    p.set_defaults(func=cmd_time_stops)
-
-    p = sub.add_parser("validate-rr", help="Validate R/R with live bid/ask before placing order")
-    p.add_argument("symbol", help="Ticker symbol")
-    p.add_argument("entry", type=float, help="Planned entry price")
+    p = sub.add_parser("validate-rr", help="Validate R/R with live prices")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("entry", type=float, help="Entry price")
     p.add_argument("tp", type=float, help="Take-profit price")
     p.add_argument("sl", type=float, help="Stop-loss price")
-    p.add_argument("--side", default="buy", choices=["buy", "sell"], help="buy=long, sell=short (default: buy)")
-    p.add_argument("--min-rr", type=float, default=1.5, help="Minimum R/R ratio (default 1.5, use 1.3 for VIX>28)")
-    p.set_defaults(func=cmd_validate_rr)
+    p.add_argument("--side", default="buy", choices=["buy", "sell"])
+    p.add_argument("--min-rr", type=float, default=1.5)
 
-    p = sub.add_parser("sector", help="Show GICS sector for symbol(s)")
-    p.add_argument("symbols", nargs="+", help="Ticker symbol(s)")
-    p.set_defaults(func=cmd_sector)
+    p = sub.add_parser("time-stops", help="Check positions exceeding max hold time")
+    p.add_argument("--max-days", type=int, default=10, help="Max days to hold (default: 10)")
 
+    p = sub.add_parser("trail-stops", help="Adjust trailing stops for profitable positions")
+    p.add_argument("--breakeven-pct", type=float, default=3.0, help="Move SL to breakeven at this PnL%")
+    p.add_argument("--trail-pct", type=float, default=2.0, help="Trail distance in %%")
+    p.add_argument("--dry-run", action="store_true", help="Show adjustments without executing")
+
+    p = sub.add_parser("category", help="Look up crypto categories")
+    p.add_argument("symbols", nargs="+", help="Base symbols (BTC, ETH, SOL)")
+
+    # --- History ---
+    p = sub.add_parser("closed-orders", help="Historical closed orders")
+    p.add_argument("--symbol", default=None, help="Filter by symbol")
+    p.add_argument("--days", type=int, default=30, help="Lookback days")
+
+    p = sub.add_parser("trades", help="Trade history (fills)")
+    p.add_argument("symbol", help="Symbol")
+    p.add_argument("--days", type=int, default=30, help="Lookback days")
+
+    return parser
+
+
+COMMAND_MAP = {
+    "account": cmd_account,
+    "positions": cmd_positions,
+    "orders": cmd_orders,
+    "quote": cmd_quote,
+    "bars": cmd_bars,
+    "asset": cmd_asset,
+    "funding": cmd_funding,
+    "status": cmd_status,
+    "analyze": cmd_analyze,
+    "bracket": cmd_bracket,
+    "close": cmd_close,
+    "cancel": cmd_cancel,
+    "cancel-all": cmd_cancel_all,
+    "set-leverage": cmd_set_leverage,
+    "set-margin": cmd_set_margin,
+    "reconcile": cmd_reconcile,
+    "check-protection": cmd_check_protection,
+    "validate-rr": cmd_validate_rr,
+    "time-stops": cmd_time_stops,
+    "trail-stops": cmd_trail_stops,
+    "category": cmd_category,
+    "closed-orders": cmd_closed_orders,
+    "trades": cmd_trades,
+}
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
-    sys.exit(args.func(args))
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    handler = COMMAND_MAP.get(args.command)
+    if handler is None:
+        print(f"Unknown command: {args.command}", file=sys.stderr)
+        return 1
+
+    try:
+        return handler(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(json.dumps({"error": str(e), "type": type(e).__name__}, indent=2), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

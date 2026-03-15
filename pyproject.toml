@@ -1,14 +1,13 @@
 [project]
-name = "claude-trading"
+name = "trappist"
 version = "2.0.0"
-description = "AI-powered swing trading bot using multi-agent orchestration"
+description = "AI-powered crypto futures trading bot — CCXT + Binance Futures + Claude Code orchestration"
 requires-python = ">=3.10"
 dependencies = [
-    "alpaca-py>=0.30.0",
+    "ccxt>=4.4.0",
     "python-dotenv>=1.0.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
-    "pytz>=2024.1",
     "requests>=2.28.0",
 ]
 

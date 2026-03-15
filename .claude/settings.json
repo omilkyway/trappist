@@ -1,138 +1,26 @@
 {
-  "env": {
-    "TRADING_MODE": "paper",
-    "ALPACA_BASE_URL": "https://paper-api.alpaca.markets"
-  },
   "permissions": {
     "allow": [
-      "Bash(mkdir:*)",
-      "Bash(uv:*)",
-      "Bash(find:*)",
-      "Bash(mv:*)",
-      "Bash(grep:*)",
-      "Bash(npm:*)",
-      "Bash(ls:*)",
-      "Bash(cp:*)",
-      "Bash(python:*)",
+      "Bash(python trading/*)",
+      "Bash(python3 trading/*)",
+      "Bash(source .venv/*)",
+      "Bash(pip *)",
+      "Bash(uv *)",
+      "Bash(curl*)",
+      "Bash(jq*)",
+      "Bash(cat state.json*)",
+      "Bash(cat progress.md*)",
+      "Bash(cat keys.local.json*)",
+      "Read",
       "Write",
-      "Edit",
-      "Bash(chmod:*)",
-      "Bash(touch:*)"
+      "mcp__binance-futures__*",
+      "mcp__fear-greed__*",
+      "mcp__gloria-news__*",
+      "mcp__tradingview__*"
     ],
-    "deny": []
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/pre_tool_use.py"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__alpaca",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/risk_guardian.py",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/risk_guardian.py",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/post_tool_use.py"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/notification.py"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/subagent_stop.py"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/stop.py"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/user_prompt_submit.py"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/pre_compact.py"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run .claude/hooks/session_start.py"
-          }
-        ]
-      }
+    "deny": [
+      "Bash(rm -rf*)",
+      "Bash(sudo*)"
     ]
-  },
-  "enabledPlugins": {
-    "equity-research@financial-services-plugins": true,
-    "financial-analysis@financial-services-plugins": true
   }
 }

@@ -1,7 +1,7 @@
-"""Technical indicators for swing trading analysis.
+"""Technical indicators for crypto futures trading analysis.
 
-Calculates EMA, MACD, RSI, Bollinger Bands, ATR, and volume ratios
-from OHLCV data returned by the Alpaca SDK.
+Calculates EMA, MACD, RSI, Bollinger Bands, ATR, volume ratios,
+and funding rate signals from OHLCV data.
 """
 
 from __future__ import annotations
@@ -150,6 +150,42 @@ def volume_ratio(volume: pd.Series | pd.DataFrame, period: int = 20) -> pd.Serie
 
 
 # ---------------------------------------------------------------------------
+# Funding rate signal (crypto-specific)
+# ---------------------------------------------------------------------------
+
+def funding_rate_signal(funding_rate: float) -> dict:
+    """Score based on perpetual futures funding rate.
+
+    Negative funding (shorts paying longs) → long bias.
+    Positive funding (longs paying shorts) → short bias when elevated.
+
+    Returns dict with long_score and short_score contributions.
+    """
+    long_adj = 0
+    short_adj = 0
+
+    if funding_rate < -0.05:
+        # Extreme negative — strong long signal
+        long_adj += 3
+    elif funding_rate < 0:
+        # Negative — moderate long bias
+        long_adj += 2
+
+    if funding_rate > 0.1:
+        # Extreme positive — strong short signal
+        short_adj += 3
+    elif funding_rate > 0.05:
+        # Very positive — moderate short bias
+        short_adj += 2
+
+    return {
+        "funding_rate": funding_rate,
+        "long_score": long_adj,
+        "short_score": short_adj,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Support / Resistance detection via pivot points
 # ---------------------------------------------------------------------------
 
@@ -237,8 +273,8 @@ _SIGNAL_WEIGHTS = {
     "price_sma200":  (+2, -2),
 }
 
-_MAX_RAW = 21   # 16 base + 5 independent directional bonuses
-_MIN_RAW = -16
+_MAX_RAW = 24   # 16 base + 5 independent directional bonuses + 3 funding rate
+_MIN_RAW = -19   # -16 base - 3 funding rate
 
 
 def _score_to_metrics(raw: int) -> dict:
@@ -265,12 +301,20 @@ def _score_to_metrics(raw: int) -> dict:
     }
 
 
-def compute_signals(df: pd.DataFrame) -> dict:
-    """Compute trading signals from a daily OHLCV DataFrame.
+def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> dict:
+    """Compute trading signals from an OHLCV DataFrame.
 
     Returns BOTH long and short scores (0-100).
     Long score = how good is this as a BUY setup.
     Short score = how good is this as a SHORT setup (inverted signals).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        OHLCV data with at least 50 bars.
+    funding_rate : float | None
+        Perpetual futures funding rate (e.g. 0.01 for 0.01%).
+        When provided, adjusts long/short scores based on funding bias.
 
     Raises ValueError if data is insufficient or malformed.
     """
@@ -440,6 +484,13 @@ def compute_signals(df: pd.DataFrame) -> dict:
             elif gap_now > gap_5ago and gap_now > 0:
                 long_raw += 1   # bullish gap widening
 
+    # --- FUNDING RATE SIGNAL (crypto-specific) ---
+    funding_info = None
+    if funding_rate is not None:
+        funding_info = funding_rate_signal(funding_rate)
+        long_raw += funding_info["long_score"]
+        short_raw += funding_info["short_score"]
+
     long_m = _score_to_metrics(long_raw)
     short_m = _score_to_metrics(short_raw)
 
@@ -508,5 +559,99 @@ def compute_signals(df: pd.DataFrame) -> dict:
             "short_strength": short_m["strength"],
             "long_raw": long_raw,
             "short_raw": short_raw,
+            "funding_rate": funding_info,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe analysis (crypto-specific)
+# ---------------------------------------------------------------------------
+
+# Default weights: higher timeframes dominate trend, lower timeframes
+# refine entry timing.  Keys are timeframe labels (e.g. "5m", "1h", "4h",
+# "1d").  Unlisted timeframes receive weight 1.0.
+_MTF_WEIGHTS: dict[str, float] = {
+    "1m":  0.5,
+    "5m":  0.8,
+    "15m": 1.0,
+    "30m": 1.2,
+    "1h":  1.5,
+    "2h":  1.8,
+    "4h":  2.0,
+    "1d":  2.5,
+    "1w":  3.0,
+}
+
+
+def compute_multi_timeframe(
+    timeframes: dict[str, pd.DataFrame],
+    *,
+    funding_rate: float | None = None,
+) -> dict:
+    """Combine signals from multiple timeframes into a single view.
+
+    Parameters
+    ----------
+    timeframes : dict[str, pd.DataFrame]
+        Mapping of timeframe label (e.g. "5m", "1h", "4h", "1d") to an
+        OHLCV DataFrame suitable for ``compute_signals``.
+    funding_rate : float | None
+        Perpetual futures funding rate, forwarded to each
+        ``compute_signals`` call.
+
+    Returns
+    -------
+    dict with keys:
+        - ``combined_long_score``  (0-100 weighted average)
+        - ``combined_short_score`` (0-100 weighted average)
+        - ``dominant_direction``   ("long" | "short" | "neutral")
+        - ``timeframe_details``    per-timeframe signal results
+        - ``weights_used``         effective weights applied
+    """
+    if not timeframes:
+        raise ValueError("timeframes dict must contain at least one entry")
+
+    per_tf: dict[str, dict] = {}
+    weighted_long = 0.0
+    weighted_short = 0.0
+    total_weight = 0.0
+
+    for tf_label, df in timeframes.items():
+        signals = compute_signals(df, funding_rate=funding_rate)
+        weight = _MTF_WEIGHTS.get(tf_label, 1.0)
+
+        weighted_long += signals["signals"]["long_score"] * weight
+        weighted_short += signals["signals"]["short_score"] * weight
+        total_weight += weight
+
+        per_tf[tf_label] = {
+            "weight": weight,
+            "long_score": signals["signals"]["long_score"],
+            "short_score": signals["signals"]["short_score"],
+            "long_strength": signals["signals"]["long_strength"],
+            "short_strength": signals["signals"]["short_strength"],
+            "price": signals["price"],
+            "rsi14": signals["indicators"]["rsi14"],
+            "ema_trend": signals["indicators"]["ema_trend"],
+        }
+
+    combined_long = round(weighted_long / total_weight, 1)
+    combined_short = round(weighted_short / total_weight, 1)
+
+    if combined_long - combined_short >= 5:
+        dominant = "long"
+    elif combined_short - combined_long >= 5:
+        dominant = "short"
+    else:
+        dominant = "neutral"
+
+    return {
+        "combined_long_score": combined_long,
+        "combined_short_score": combined_short,
+        "dominant_direction": dominant,
+        "timeframe_details": per_tf,
+        "weights_used": {
+            tf: _MTF_WEIGHTS.get(tf, 1.0) for tf in timeframes
         },
     }

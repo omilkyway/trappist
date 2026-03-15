@@ -1,1 +1,1 @@
-"""Claude Trading — AI-powered swing trading with alpaca-py SDK."""
+"""TRAPPIST — Crypto futures trading with CCXT + Binance Futures."""

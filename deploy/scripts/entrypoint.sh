@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-RUN_TYPE="${1:-${RUN_TYPE:-open}}"
+RUN_TYPE="${1:-${RUN_TYPE:-cycle}}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-S3_BUCKET="s3://claude-trading"
+S3_BUCKET="s3://trappist"
 S3_ENABLED="${SCW_S3_ACCESS_KEY:-}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
@@ -24,7 +24,7 @@ send_auth_alert() {
     local REASON="${1:-OAuth token needs refresh}"
     if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
         curl -sf -H "Content-Type: application/json" \
-            -d "{\"embeds\":[{\"title\":\"OAuth Auth — Fallback API Key\",\"description\":\"**Raison:** ${REASON}\\n\\nLe job continue avec la cl\u00e9 API. Pour r\u00e9activer OAuth :\\n\\n**1.** Sur ta machine :\\n\\\`\\\`\\\`\\nclaude auth login\\n\\\`\\\`\\\`\\n**2.** Puis push les creds :\\n\\\`\\\`\\\`\\nbash deploy/scripts/reauth.sh\\n\\\`\\\`\\\`\\n\\n**Lien direct auth :** [claude.ai/settings](https://claude.ai/settings)\",\"color\":16750848,\"footer\":{\"text\":\"claude-trading v2.2 \u2022 job continue en API key\"}}]}" \
+            -d "{\"embeds\":[{\"title\":\"OAuth Auth — Fallback API Key\",\"description\":\"**Raison:** ${REASON}\\n\\nLe job continue avec la cl\u00e9 API. Pour r\u00e9activer OAuth :\\n\\n**1.** Sur ta machine :\\n\\\`\\\`\\\`\\nclaude auth login\\n\\\`\\\`\\\`\\n**2.** Puis push les creds :\\n\\\`\\\`\\\`\\nbash deploy/scripts/reauth.sh\\n\\\`\\\`\\\`\\n\\n**Lien direct auth :** [claude.ai/settings](https://claude.ai/settings)\",\"color\":16750848,\"footer\":{\"text\":\"trappist v2.0 \u2022 job continue en API key\"}}]}" \
             "$DISCORD_WEBHOOK_URL" || true
     fi
 }
@@ -124,8 +124,8 @@ fi
 # ==================================================================
 # 2. RECONCILE (prevents phantom position blocking)
 # ==================================================================
-if [[ "$RUN_TYPE" == "open" ]]; then
-    log "Reconciling progress.md with live Alpaca positions..."
+if [[ "$RUN_TYPE" == "cycle" ]]; then
+    log "Reconciling progress.md with live Binance Futures positions..."
     /app/.venv/bin/python /app/trading/executor.py reconcile 2>&1 || log "WARNING: Reconciliation failed (non-fatal)"
 fi
 
@@ -133,38 +133,30 @@ fi
 # 3. ROUTE TO CORRECT RUN TYPE
 # ==================================================================
 case "$RUN_TYPE" in
-  open)
-    log "=== MARKET OPEN — Full trading pipeline ==="
+  cycle)
+    log "=== TRADING CYCLE — Full crypto pipeline (24/7) ==="
     PROMPT="/make-profitables-trades"
     MAX_TURNS=35
     ;;
-  close)
-    log "=== MARKET CLOSE — Position review & management ==="
-    PROMPT="Execute end-of-day position review:
+  review)
+    log "=== PORTFOLIO REVIEW — Position management ==="
+    PROMPT="Execute portfolio review:
 1. python trading/executor.py trail-stops — auto-tighten SL for profitable positions
-2. python trading/executor.py account — get current equity, daily P&L
-3. python trading/executor.py positions — all open positions with P&L
+2. python trading/executor.py account — get current equity
+3. python trading/executor.py positions — all open positions with PnL
 4. python trading/executor.py orders — check pending orders
 5. python trading/executor.py check-protection — verify all positions have SL/TP
-6. For each position:
-   - Calculate days held (time stop: >10 days = close)
-   - Check distance to stop-loss and take-profit
-   - If daily drawdown > -1.5%: tighten stops to -3%
-7. Close any positions that hit time stop (>10 trading days)
-8. Generate EOD report in reports/eod-review-${TIMESTAMP}.md
-9. Update progress.md with:
-   - Current equity and daily P&L
-   - All open positions with entry, current, SL, TP, days held
-   - Risk flags (circuit breaker status, VIX level)
-   - Watchlist for next session
-   - Cumulative performance stats"
+6. python trading/executor.py time-stops --max-days 10 — check expired positions
+7. Close any positions that hit time stop (>10 days)
+8. Generate review report in reports/review-${TIMESTAMP}.md
+9. Update progress.md with current state"
     MAX_TURNS=25
     ;;
   protect)
-    log "=== POST-OPEN — OCO Protection ==="
+    log "=== PROTECTION CHECK ==="
     ;;
   *)
-    log "Unknown run type: $RUN_TYPE (expected: open, close, protect)"
+    log "Unknown run type: $RUN_TYPE (expected: cycle, review, protect)"
     exit 1
     ;;
 esac
@@ -210,24 +202,13 @@ is_auth_error() {
 
 if [[ "$RUN_TYPE" == "protect" ]]; then
     # Lightweight — no LLM needed.
-    log "Phase 1: Watching for OPG fills (5 min polling)..."
     set +e
-    /app/.venv/bin/python /app/trading/executor.py watch-fills \
-        --file /app/pending_protections.json \
-        --timeout 300 \
-        --interval 15 \
+    log "Phase 1: Check protection on all positions..."
+    /app/.venv/bin/python /app/trading/executor.py check-protection \
         2>&1 | tee "/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
-    WATCH_CODE=${PIPESTATUS[0]}
-
-    log "Phase 2: Fallback protector check..."
-    /app/.venv/bin/python /app/trading/protector.py \
-        --file /app/pending_protections.json \
-        --retries 2 \
-        --delay 15 \
-        2>&1 | tee -a "/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
     EXIT_CODE=${PIPESTATUS[0]}
 
-    log "Phase 3: Trailing stops adjustment..."
+    log "Phase 2: Trailing stops adjustment..."
     /app/.venv/bin/python /app/trading/executor.py trail-stops \
         2>&1 | tee -a "/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
     set -e

@@ -1,8 +1,8 @@
-# ── Claude Trading Bot — Scaleway Serverless ──
-# Source: source ~/MILKY-WAY/DEV/cc/claude-trading/deploy/aliases.sh
-# Add to .zshrc: source ~/MILKY-WAY/DEV/cc/claude-trading/deploy/aliases.sh
+# ── TRAPPIST — Scaleway Serverless ──
+# Source: source ~/MILKY-WAY/DEV/cc/TRAPPIST/deploy/aliases.sh
+# Add to .zshrc: source ~/MILKY-WAY/DEV/cc/TRAPPIST/deploy/aliases.sh
 
-source ~/.claude-trading-jobs 2>/dev/null
+source ~/.trappist-jobs 2>/dev/null
 SCW=~/.local/bin/scw
 
 # ── Monitoring ──
@@ -23,14 +23,14 @@ bot-run-log() {
 }
 
 # ── Trigger manual ──
-alias bot-run-open="$SCW jobs definition start \$OPEN_ID region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'"
+alias bot-run-cycle="$SCW jobs definition start \$CYCLE_ID region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'"
 alias bot-run-protect="$SCW jobs definition start \$PROTECT_ID region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'"
-alias bot-run-close="$SCW jobs definition start \$CLOSE_ID region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'"
+alias bot-run-review="$SCW jobs definition start \$REVIEW_ID region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'"
 
 # ── Deploy ──
 bot-deploy() {
-    local IMAGE="rg.fr-par.scw.cloud/claude-trading/claude-bot:latest"
-    local PROJECT_DIR=~/MILKY-WAY/DEV/cc/claude-trading
+    local IMAGE="rg.fr-par.scw.cloud/trappist/crypto-bot:latest"
+    local PROJECT_DIR=~/MILKY-WAY/DEV/cc/TRAPPIST
     echo "Building image..."
     DOCKER_BUILDKIT=0 docker build -f "$PROJECT_DIR/deploy/Dockerfile" -t "$IMAGE" "$PROJECT_DIR/"
     echo "Pushing image..."
@@ -40,8 +40,12 @@ bot-deploy() {
 
 # ── OAuth re-auth (when Discord alerts AUTH FAIL) ──
 bot-reauth() {
-    bash ~/MILKY-WAY/DEV/cc/claude-trading/deploy/scripts/reauth.sh "$@"
+    bash ~/MILKY-WAY/DEV/cc/TRAPPIST/deploy/scripts/reauth.sh "$@"
 }
+
+# ── S3 state ──
+alias bot-s3-ls="aws --profile scaleway s3 ls s3://trappist/ --recursive"
+alias bot-s3-progress="aws --profile scaleway s3 cp s3://trappist/progress.md -"
 
 # ── Check OAuth token status ──
 bot-auth-status() {

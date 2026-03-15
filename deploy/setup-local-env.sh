@@ -1,11 +1,11 @@
 #!/bin/bash
-# Setup local environment for claude-trading CLI tools.
+# Setup local environment for TRAPPIST CLI tools.
 # Sources .env.local and configures AWS scaleway profile for S3 access.
 #
 # Usage:
 #   source deploy/setup-local-env.sh
 #   # Then you can run: python trading/executor.py account
-#   # And: aws --profile scaleway s3 ls s3://claude-trading/
+#   # And: aws --profile scaleway s3 ls s3://trappist/
 
 set -euo pipefail
 
@@ -39,7 +39,6 @@ fi
 if [[ -n "${SCW_S3_ACCESS_KEY:-}" ]]; then
     mkdir -p ~/.aws
 
-    # Update credentials
     if ! grep -q '^\[scaleway\]' ~/.aws/credentials 2>/dev/null; then
         cat >> ~/.aws/credentials << CREDS
 
@@ -49,7 +48,6 @@ aws_secret_access_key = ${SCW_S3_SECRET_KEY}
 CREDS
         echo "  Created AWS credentials profile [scaleway]"
     else
-        # Update existing profile
         python3 -c "
 import configparser, os
 p = os.path.expanduser('~/.aws/credentials')
@@ -65,7 +63,6 @@ with open(p, 'w') as f:
         echo "  Updated AWS credentials profile [scaleway]"
     fi
 
-    # Update config
     if ! grep -q '^\[profile scaleway\]' ~/.aws/config 2>/dev/null; then
         cat >> ~/.aws/config << CONF
 
@@ -84,12 +81,12 @@ fi
 # ─── Verify ───
 echo ""
 echo "Environment ready:"
-echo "  APCA_API_KEY_ID:   ${APCA_API_KEY_ID:+SET (${#APCA_API_KEY_ID} chars)}"
-echo "  APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:+SET}"
+echo "  BINANCE_KEY_API:   ${BINANCE_KEY_API:+SET (${#BINANCE_KEY_API} chars)}"
+echo "  BINANCE_KEY_SECRET: ${BINANCE_KEY_SECRET:+SET}"
 echo "  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:+SET}"
 echo "  SCW_S3_ACCESS_KEY: ${SCW_S3_ACCESS_KEY:+SET}"
 echo "  AWS profile:       scaleway"
 echo ""
 echo "Test commands:"
 echo "  python trading/executor.py account"
-echo "  aws --profile scaleway s3 ls s3://claude-trading/"
+echo "  aws --profile scaleway s3 ls s3://trappist/"

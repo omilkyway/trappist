@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "binance-futures": {
+      "command": "uv",
+      "args": [
+        "--directory", "mcp-servers/mcp-binance-futures",
+        "run", "mcp-binance-futures"
+      ],
+      "env": {
+        "BINANCE_API_KEY": "${BINANCE_API_KEY}",
+        "BINANCE_API_SECRET": "${BINANCE_API_SECRET}"
+      }
+    },
+    "fear-greed": {
+      "command": "uv",
+      "args": [
+        "--directory", "mcp-servers/crypto-feargreed-mcp",
+        "run", "main.py"
+      ]
+    },
+    "gloria-news": {
+      "command": "uv",
+      "args": [
+        "--directory", "mcp-servers/gloria-mcp",
+        "run", "gloria-mcp"
+      ],
+      "env": {
+        "GLORIA_API_TOKEN": "${GLORIA_API_TOKEN}",
+        "AI_HUB_BASE_URL": "https://ai-hub.cryptobriefing.com"
+      }
+    },
+    "tradingview": {
+      "command": "uv",
+      "args": [
+        "--directory", "mcp-servers/mcp-tradingview-server",
+        "run", "mcp-tradingview"
+      ]
+    }
+  }
+}

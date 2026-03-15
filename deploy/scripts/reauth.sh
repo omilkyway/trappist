@@ -112,12 +112,12 @@ fi
 # ─── Step 6 (optional): Trigger test run ───
 if [[ "${1:-}" == "--test" ]]; then
     log "Step 6: Triggering test run..."
-    source ~/.claude-trading-jobs 2>/dev/null || true
-    if [[ -n "${OPEN_ID:-}" ]]; then
-        $SCW jobs definition start "$OPEN_ID" region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'
+    source ~/.trappist-jobs 2>/dev/null || true
+    if [[ -n "${CYCLE_ID:-}" ]]; then
+        $SCW jobs definition start "$CYCLE_ID" region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'
         log "Test run triggered. Check bot-status in a few minutes."
     else
-        log "WARNING: No job IDs found in ~/.claude-trading-jobs — skip test run"
+        log "WARNING: No job IDs found in ~/.trappist-jobs — skip test run"
     fi
 fi
 

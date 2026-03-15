@@ -1,26 +1,32 @@
-"""Alpaca client wrapper with bracket order support.
+"""CCXT Binance Futures client wrapper.
 
-Provides a thin layer over alpaca-py that:
-- Loads credentials from env vars (.env supported)
-- Exposes bracket orders, OPG+OCO flow, position management
-- Returns typed results the agents and executor can consume
+Provides a thin layer over ccxt.binance that:
+- Loads credentials from env vars or keys.local.json
+- Supports testnet/live mode switching
+- Exposes bracket orders, position management, funding rates
+- Returns plain dicts the agents and executor can consume
+- Retries transient errors with exponential backoff
 """
 
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+
+import ccxt
 
 from dotenv import load_dotenv
 
-from alpaca.common.exceptions import APIError
-
 logger = logging.getLogger(__name__)
+
+load_dotenv()
+load_dotenv(".env.local", override=True)
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +35,9 @@ logger = logging.getLogger(__name__)
 
 def _is_transient_error(exc: Exception) -> bool:
     """Return True if the error is likely transient and worth retrying."""
-    if isinstance(exc, APIError):
-        # 429 = rate limit, 5xx = server errors
-        return exc.status_code in (429, 500, 502, 503, 504)
-    # Network errors, timeouts
+    if isinstance(exc, (ccxt.RateLimitExceeded, ccxt.RequestTimeout,
+                        ccxt.NetworkError, ccxt.ExchangeNotAvailable)):
+        return True
     err_msg = str(exc).lower()
     return any(kw in err_msg for kw in ("timeout", "connection", "reset", "refused", "unavailable"))
 
@@ -56,37 +61,9 @@ def retry_api(max_attempts: int = 3, base_delay: float = 1.0):
                         func.__name__, attempt, max_attempts, exc, delay,
                     )
                     time.sleep(delay)
-            raise last_exc  # unreachable but satisfies type checker
+            raise last_exc  # type: ignore
         return wrapper
     return decorator
-
-
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import (
-    StockBarsRequest,
-    StockLatestBarRequest,
-    StockLatestQuoteRequest,
-    StockLatestTradeRequest,
-)
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import (
-    OrderClass,
-    OrderSide,
-    OrderType,
-    QueryOrderStatus,
-    TimeInForce,
-)
-from alpaca.trading.requests import (
-    ClosePositionRequest,
-    GetOrdersRequest,
-    LimitOrderRequest,
-    MarketOrderRequest,
-    StopOrderRequest,
-)
-
-load_dotenv()  # loads .env
-load_dotenv(".env.local", override=True)  # loads .env.local (overrides .env)
 
 
 # ---------------------------------------------------------------------------
@@ -94,35 +71,100 @@ load_dotenv(".env.local", override=True)  # loads .env.local (overrides .env)
 # ---------------------------------------------------------------------------
 
 def _get_credentials() -> tuple[str, str, bool]:
-    """Return (api_key, secret_key, is_paper) from env vars."""
-    key = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY", "")
-    secret = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY", "")
-    paper = os.environ.get("ALPACA_PAPER_TRADE", "True").lower() in ("true", "1", "yes")
-    return key, secret, paper
+    """Return (api_key, secret, is_sandbox) from env vars or keys.local.json."""
+    def _env(name: str) -> str:
+        """Get env var, returning '' if it's a placeholder."""
+        val = os.environ.get(name, "")
+        if "REPLACE" in val or "your_" in val:
+            return ""
+        return val
+
+    # Try env vars (support multiple naming conventions)
+    key = _env("BINANCE_API_KEY") or _env("BINANCE_KEY_API") or ""
+    secret = (_env("BINANCE_API_SECRET") or _env("BINANCE_SECRET")
+              or _env("BINANCE_KEY_SECRET") or "")
+    sandbox = os.environ.get("LIVE_MODE", "").lower() not in ("true", "1", "yes")
+
+    # Fall back to keys.local.json
+    if not key or not secret:
+        keys_path = Path(__file__).resolve().parent.parent / "keys.local.json"
+        if keys_path.exists():
+            try:
+                with open(keys_path) as f:
+                    keys = json.load(f)
+                binance_keys = keys.get("binance", {})
+                key = key or binance_keys.get("apiKey", "")
+                secret = secret or binance_keys.get("secret", "")
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    return key, secret, sandbox
 
 
 # ---------------------------------------------------------------------------
-# Singleton clients
+# Singleton exchange client
 # ---------------------------------------------------------------------------
 
-_trading_client: Optional[TradingClient] = None
-_data_client: Optional[StockHistoricalDataClient] = None
+_exchange: Optional[ccxt.binanceusdm] = None
 
 
-def get_trading_client() -> TradingClient:
-    global _trading_client
-    if _trading_client is None:
-        key, secret, paper = _get_credentials()
-        _trading_client = TradingClient(key, secret, paper=paper)
-    return _trading_client
+def get_exchange() -> ccxt.binanceusdm:
+    """Return a configured ccxt.binanceusdm instance (USDT-M Futures only).
+
+    Uses binanceusdm (not binance) to avoid loading spot/margin markets
+    which require authentication. binanceusdm only loads futures markets.
+
+    Binance deprecated the old futures testnet. Use Demo Trading keys
+    (generated from Binance app) or real keys with LIVE_MODE=true.
+    """
+    global _exchange
+    if _exchange is None:
+        key, secret, sandbox = _get_credentials()
+
+        config = {
+            "apiKey": key if key and "REPLACE" not in key else "",
+            "secret": secret if secret and "REPLACE" not in secret else "",
+            "options": {
+                "adjustForTimeDifference": True,
+                "fetchCurrencies": False,     # avoid sapi auth calls
+                "fetchMarginMarkets": False,  # avoid sapi margin calls
+                "warnOnFetchOpenOrdersWithoutSymbol": False,
+            },
+            "enableRateLimit": True,
+        }
+
+        _exchange = ccxt.binanceusdm(config)
+
+        # If sandbox/testnet mode, override URLs manually
+        # (CCXT v4+ blocks set_sandbox_mode for binanceusdm)
+        if sandbox:
+            testnet = "https://testnet.binancefuture.com"
+            for url_key in list(_exchange.urls.get("api", {}).keys()):
+                url = _exchange.urls["api"][url_key]
+                if isinstance(url, str):
+                    if "fapi.binance.com" in url:
+                        _exchange.urls["api"][url_key] = url.replace(
+                            "https://fapi.binance.com", testnet
+                        )
+                    elif "api.binance.com" in url:
+                        _exchange.urls["api"][url_key] = url.replace(
+                            "https://api.binance.com", testnet
+                        )
+
+        _exchange.load_markets()
+    return _exchange
 
 
-def get_data_client() -> StockHistoricalDataClient:
-    global _data_client
-    if _data_client is None:
-        key, secret, _ = _get_credentials()
-        _data_client = StockHistoricalDataClient(key, secret)
-    return _data_client
+def reset_exchange():
+    """Reset the singleton (useful for testing or credential rotation)."""
+    global _exchange
+    _exchange = None
+
+
+def is_sandbox() -> bool:
+    """Return True if running in testnet mode."""
+    _, _, sandbox = _get_credentials()
+    return sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -130,81 +172,120 @@ def get_data_client() -> StockHistoricalDataClient:
 # ---------------------------------------------------------------------------
 
 @retry_api()
-def get_account() -> dict:
-    """Return account info as a plain dict."""
-    acct = get_trading_client().get_account()
+def get_balance() -> dict:
+    """Return account balance info as a plain dict."""
+    exchange = get_exchange()
+    balance = exchange.fetch_balance()
+    usdt = balance.get("USDT", {})
+    total_usdt = float(usdt.get("total", 0) or 0)
+    free_usdt = float(usdt.get("free", 0) or 0)
+    used_usdt = float(usdt.get("used", 0) or 0)
+
     return {
-        "equity": float(acct.equity),
-        "buying_power": float(acct.buying_power),
-        "cash": float(acct.cash),
-        "last_equity": float(acct.last_equity),
-        "pattern_day_trader": acct.pattern_day_trader,
-        "account_number": acct.account_number,
+        "total": total_usdt,
+        "free": free_usdt,
+        "used": used_usdt,
+        "currency": "USDT",
+        "sandbox": is_sandbox(),
+    }
+
+
+@retry_api()
+def get_account() -> dict:
+    """Return account summary including balance, margin, and positions value."""
+    exchange = get_exchange()
+    balance = exchange.fetch_balance()
+    usdt = balance.get("USDT", {})
+
+    # Fetch positions to calculate unrealized PnL and exposure
+    positions = get_positions()
+    total_unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+    total_exposure = sum(abs(p.get("notional", 0)) for p in positions)
+
+    total_usdt = float(usdt.get("total", 0) or 0)
+    free_usdt = float(usdt.get("free", 0) or 0)
+
+    return {
+        "equity": total_usdt,
+        "free": free_usdt,
+        "used": float(usdt.get("used", 0) or 0),
+        "unrealized_pnl": round(total_unrealized_pnl, 4),
+        "total_exposure": round(total_exposure, 2),
+        "exposure_pct": round(total_exposure / total_usdt * 100, 2) if total_usdt > 0 else 0,
+        "positions_count": len(positions),
+        "currency": "USDT",
+        "sandbox": is_sandbox(),
     }
 
 
 @retry_api()
 def get_positions() -> list[dict]:
     """Return all open positions as list of dicts."""
-    positions = get_trading_client().get_all_positions()
-    return [
-        {
-            "symbol": p.symbol,
-            "qty": float(p.qty),
-            "side": str(p.side),
-            "avg_entry_price": float(p.avg_entry_price),
-            "market_value": float(p.market_value),
-            "unrealized_pl": float(p.unrealized_pl),
-            "unrealized_plpc": float(p.unrealized_plpc),
-            "current_price": float(p.current_price),
-        }
-        for p in positions
-    ]
+    exchange = get_exchange()
+    positions = exchange.fetch_positions()
+    result = []
+    for p in positions:
+        contracts = float(p.get("contracts", 0) or 0)
+        if contracts == 0:
+            continue
+        entry_price = float(p.get("entryPrice", 0) or 0)
+        mark_price = float(p.get("markPrice", 0) or 0)
+        notional = float(p.get("notional", 0) or 0)
+        unrealized_pnl = float(p.get("unrealizedPnl", 0) or 0)
+        leverage = float(p.get("leverage", 1) or 1)
+        liq_price = float(p.get("liquidationPrice", 0) or 0)
+        margin = float(p.get("initialMargin", 0) or p.get("collateral", 0) or 0)
+
+        side = p.get("side", "long")
+        symbol = p.get("symbol", "")
+
+        # Calculate PnL percentage
+        pnl_pct = 0.0
+        if entry_price > 0 and contracts > 0:
+            if side == "long":
+                pnl_pct = (mark_price - entry_price) / entry_price * 100
+            else:
+                pnl_pct = (entry_price - mark_price) / entry_price * 100
+
+        result.append({
+            "symbol": symbol,
+            "side": side,
+            "contracts": contracts,
+            "entry_price": entry_price,
+            "mark_price": mark_price,
+            "notional": abs(notional),
+            "unrealized_pnl": round(unrealized_pnl, 4),
+            "pnl_pct": round(pnl_pct, 2),
+            "leverage": leverage,
+            "liquidation_price": liq_price,
+            "margin": round(margin, 4),
+            "margin_mode": p.get("marginMode", "cross"),
+            "timestamp": p.get("timestamp"),
+        })
+    return result
 
 
 @retry_api()
-def get_open_orders() -> list[dict]:
+def get_open_orders(symbol: str | None = None) -> list[dict]:
     """Return all open orders as list of dicts."""
-    orders = get_trading_client().get_orders(
-        GetOrdersRequest(status=QueryOrderStatus.OPEN)
-    )
+    exchange = get_exchange()
+    orders = exchange.fetch_open_orders(symbol)
     return [
         {
-            "id": str(o.id),
-            "symbol": o.symbol,
-            "side": str(o.side),
-            "qty": str(o.qty),
-            "type": str(o.type),
-            "order_class": str(o.order_class),
-            "status": str(o.status),
-            "limit_price": str(o.limit_price) if o.limit_price else None,
-            "stop_price": str(o.stop_price) if o.stop_price else None,
-            "legs": [
-                {
-                    "id": str(leg.id),
-                    "type": str(leg.type),
-                    "side": str(leg.side),
-                    "limit_price": str(leg.limit_price) if leg.limit_price else None,
-                    "stop_price": str(leg.stop_price) if leg.stop_price else None,
-                    "status": str(leg.status),
-                }
-                for leg in (o.legs or [])
-            ],
+            "id": str(o["id"]),
+            "symbol": o["symbol"],
+            "side": o["side"],
+            "type": o["type"],
+            "amount": float(o.get("amount", 0) or 0),
+            "price": float(o.get("price", 0) or 0),
+            "stop_price": float(o.get("stopPrice", 0) or 0),
+            "status": o["status"],
+            "reduce_only": o.get("reduceOnly", False),
+            "timestamp": o.get("timestamp"),
+            "datetime": o.get("datetime"),
         }
         for o in orders
     ]
-
-
-@retry_api()
-def get_clock() -> dict:
-    """Return market clock info."""
-    c = get_trading_client().get_clock()
-    return {
-        "is_open": c.is_open,
-        "timestamp": str(c.timestamp),
-        "next_open": str(c.next_open),
-        "next_close": str(c.next_close),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -212,167 +293,207 @@ def get_clock() -> dict:
 # ---------------------------------------------------------------------------
 
 @retry_api()
+def get_ticker(symbol: str) -> dict:
+    """Get current ticker (price, bid, ask, volume, change)."""
+    exchange = get_exchange()
+    t = exchange.fetch_ticker(symbol)
+    return {
+        "symbol": t["symbol"],
+        "last": float(t.get("last", 0) or 0),
+        "bid": float(t.get("bid", 0) or 0),
+        "ask": float(t.get("ask", 0) or 0),
+        "spread": round(float(t.get("ask", 0) or 0) - float(t.get("bid", 0) or 0), 6),
+        "high_24h": float(t.get("high", 0) or 0),
+        "low_24h": float(t.get("low", 0) or 0),
+        "volume_24h": float(t.get("quoteVolume", 0) or 0),
+        "change_pct": float(t.get("percentage", 0) or 0),
+        "timestamp": t.get("timestamp"),
+    }
+
+
+@retry_api()
 def get_bars(
     symbol: str,
-    timeframe: str = "1Day",
-    days: int = 60,
+    timeframe: str = "4h",
+    limit: int = 500,
+    since: int | None = None,
 ) -> "pd.DataFrame":
-    """Fetch OHLCV bars and return a pandas DataFrame."""
+    """Fetch OHLCV bars and return a pandas DataFrame.
+
+    Args:
+        symbol: Trading pair (e.g., 'BTC/USDT:USDT')
+        timeframe: Candle timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w)
+        limit: Number of candles (max 1500 on Binance Futures)
+        since: Start timestamp in ms (optional)
+    """
     import pandas as pd
 
-    tf_map = {
-        "1Min": TimeFrame.Minute,
-        "5Min": TimeFrame(5, TimeFrameUnit.Minute),
-        "15Min": TimeFrame(15, TimeFrameUnit.Minute),
-        "1Hour": TimeFrame.Hour,
-        "1Day": TimeFrame.Day,
-        "1Week": TimeFrame.Week,
-    }
-    tf = tf_map.get(timeframe, TimeFrame.Day)
+    exchange = get_exchange()
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
 
-    client = get_data_client()
-    bars = client.get_stock_bars(
-        StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=datetime.now(timezone.utc) - timedelta(days=days),
-        )
-    )
-    # bars.df returns a multi-index DataFrame (symbol, timestamp).
-    # Select the single symbol and drop that index level.
-    df = bars.df
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level="symbol")
+    if not ohlcv:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.set_index("timestamp")
     return df
 
 
 @retry_api()
-def get_latest_quote(symbol: str) -> dict:
-    """Get latest bid/ask quote."""
-    client = get_data_client()
-    quote = client.get_stock_latest_quote(
-        StockLatestQuoteRequest(symbol_or_symbols=symbol)
-    )
-    q = quote[symbol]
-    return {
-        "bid_price": float(q.bid_price),
-        "ask_price": float(q.ask_price),
-        "bid_size": int(q.bid_size),
-        "ask_size": int(q.ask_size),
-        "spread": round(float(q.ask_price) - float(q.bid_price), 4),
-        "spread_pct": round(
-            (float(q.ask_price) - float(q.bid_price)) / float(q.ask_price) * 100, 4
-        ) if float(q.ask_price) > 0 else 0,
-    }
+def get_funding_rate(symbol: str) -> dict:
+    """Get current funding rate for a symbol."""
+    exchange = get_exchange()
+    try:
+        fr = exchange.fetch_funding_rate(symbol)
+        return {
+            "symbol": fr.get("symbol", symbol),
+            "funding_rate": float(fr.get("fundingRate", 0) or 0),
+            "funding_rate_pct": round(float(fr.get("fundingRate", 0) or 0) * 100, 4),
+            "next_funding_time": fr.get("fundingDatetime"),
+            "mark_price": float(fr.get("markPrice", 0) or 0),
+            "index_price": float(fr.get("indexPrice", 0) or 0),
+        }
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "funding_rate": 0,
+            "funding_rate_pct": 0,
+            "error": str(e),
+        }
 
 
 @retry_api()
-def get_latest_trade(symbol: str) -> dict:
-    """Get latest trade for a symbol."""
-    client = get_data_client()
-    trades = client.get_stock_latest_trade(
-        StockLatestTradeRequest(symbol_or_symbols=symbol)
-    )
-    t = trades[symbol]
-    return {
-        "symbol": symbol,
-        "price": float(t.price),
-        "size": int(t.size),
-        "timestamp": str(t.timestamp),
-        "exchange": str(t.exchange) if t.exchange else None,
-    }
+def get_funding_history(symbol: str, limit: int = 100) -> list[dict]:
+    """Get historical funding rates."""
+    exchange = get_exchange()
+    try:
+        history = exchange.fetch_funding_rate_history(symbol, limit=limit)
+        return [
+            {
+                "timestamp": h.get("timestamp"),
+                "datetime": h.get("datetime"),
+                "funding_rate": float(h.get("fundingRate", 0) or 0),
+            }
+            for h in history
+        ]
+    except Exception:
+        return []
 
 
 @retry_api()
-def get_latest_bar(symbol: str) -> dict:
-    """Get latest bar for a symbol."""
-    client = get_data_client()
-    bars = client.get_stock_latest_bar(
-        StockLatestBarRequest(symbol_or_symbols=symbol)
-    )
-    b = bars[symbol]
+def get_market_info(symbol: str) -> dict:
+    """Get market info for a symbol (precision, limits, max leverage)."""
+    exchange = get_exchange()
+    market = exchange.market(symbol)
     return {
-        "symbol": symbol,
-        "open": float(b.open),
-        "high": float(b.high),
-        "low": float(b.low),
-        "close": float(b.close),
-        "volume": int(b.volume),
-        "timestamp": str(b.timestamp),
-        "vwap": float(b.vwap) if b.vwap else None,
-    }
-
-
-@retry_api()
-def get_asset_info(symbol: str) -> dict:
-    """Get asset info (tradability, exchange, class)."""
-    client = get_trading_client()
-    asset = client.get_asset(symbol)
-    return {
-        "symbol": asset.symbol,
-        "name": asset.name,
-        "exchange": str(asset.exchange),
-        "asset_class": str(asset.asset_class),
-        "tradable": asset.tradable,
-        "shortable": asset.shortable,
-        "fractionable": asset.fractionable,
-        "status": str(asset.status),
+        "symbol": market["symbol"],
+        "base": market["base"],
+        "quote": market["quote"],
+        "active": market["active"],
+        "type": market.get("type", "swap"),
+        "linear": market.get("linear", True),
+        "contract_size": float(market.get("contractSize", 1) or 1),
+        "precision": {
+            "amount": market["precision"].get("amount"),
+            "price": market["precision"].get("price"),
+        },
+        "limits": {
+            "amount_min": float(market["limits"]["amount"]["min"] or 0),
+            "amount_max": float(market["limits"]["amount"].get("max") or 0),
+            "price_min": float(market["limits"]["price"]["min"] or 0),
+            "cost_min": float(market["limits"]["cost"]["min"] or 0) if market["limits"].get("cost") else 0,
+        },
+        "maker_fee": float(market.get("maker", 0) or 0),
+        "taker_fee": float(market.get("taker", 0) or 0),
     }
 
 
 # ---------------------------------------------------------------------------
-# Order placement — BRACKET ORDERS
+# Leverage & margin
 # ---------------------------------------------------------------------------
 
-@dataclass
+@retry_api()
+def set_leverage(symbol: str, leverage: int) -> dict:
+    """Set leverage for a symbol."""
+    exchange = get_exchange()
+    try:
+        result = exchange.set_leverage(leverage, symbol)
+        return {"success": True, "symbol": symbol, "leverage": leverage, "result": str(result)}
+    except ccxt.ExchangeError as e:
+        # "No need to change leverage" is OK
+        if "no need" in str(e).lower() or "not modified" in str(e).lower():
+            return {"success": True, "symbol": symbol, "leverage": leverage, "note": "already set"}
+        return {"success": False, "error": str(e)}
+
+
+@retry_api()
+def set_margin_mode(symbol: str, mode: str = "isolated") -> dict:
+    """Set margin mode (isolated or cross) for a symbol."""
+    exchange = get_exchange()
+    try:
+        result = exchange.set_margin_mode(mode, symbol)
+        return {"success": True, "symbol": symbol, "mode": mode, "result": str(result)}
+    except ccxt.ExchangeError as e:
+        # "No need to change margin type" is OK
+        if "no need" in str(e).lower() or "not modified" in str(e).lower():
+            return {"success": True, "symbol": symbol, "mode": mode, "note": "already set"}
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Order placement
+# ---------------------------------------------------------------------------
+
 class OrderResult:
-    success: bool
-    order_id: Optional[str] = None
-    status: Optional[str] = None
-    legs: Optional[list[dict]] = None
-    error: Optional[str] = None
+    """Encapsulates the result of an order operation."""
+
+    def __init__(self, success: bool, order_id: str | None = None,
+                 status: str | None = None, details: dict | None = None,
+                 error: str | None = None):
+        self.success = success
+        self.order_id = order_id
+        self.status = status
+        self.details = details or {}
+        self.error = error
 
     def to_dict(self) -> dict:
         return {
             "success": self.success,
             "order_id": self.order_id,
             "status": self.status,
-            "legs": self.legs,
+            "details": self.details,
             "error": self.error,
         }
 
 
-def _validate_order_params(
-    qty: int,
-    take_profit_price: float,
-    stop_loss_price: float,
-    side: str,
-    limit_price: Optional[float] = None,
-) -> Optional[str]:
-    """Validate order parameters. Returns error message or None if valid."""
+def _validate_bracket_params(
+    qty: float, tp: float, sl: float, side: str, entry: float | None = None,
+) -> str | None:
+    """Validate bracket order parameters. Returns error message or None."""
     if qty <= 0:
         return f"qty must be > 0, got {qty}"
-    if take_profit_price <= 0:
-        return f"take_profit_price must be > 0, got {take_profit_price}"
-    if stop_loss_price <= 0:
-        return f"stop_loss_price must be > 0, got {stop_loss_price}"
-    if limit_price is not None and limit_price <= 0:
-        return f"limit_price must be > 0, got {limit_price}"
+    if tp <= 0:
+        return f"take_profit must be > 0, got {tp}"
+    if sl <= 0:
+        return f"stop_loss must be > 0, got {sl}"
 
     if side.lower() == "buy":
-        # LONG: TP must be above SL
-        if take_profit_price <= stop_loss_price:
-            return (
-                f"LONG order: take_profit ({take_profit_price}) must be > "
-                f"stop_loss ({stop_loss_price})"
-            )
+        # LONG: TP above entry/current, SL below
+        if tp <= sl:
+            return f"LONG: take_profit ({tp}) must be > stop_loss ({sl})"
+        if entry and tp <= entry:
+            return f"LONG: take_profit ({tp}) must be > entry ({entry})"
+        if entry and sl >= entry:
+            return f"LONG: stop_loss ({sl}) must be < entry ({entry})"
     elif side.lower() == "sell":
-        # SHORT: TP must be below SL (profit = buy back lower)
-        if take_profit_price >= stop_loss_price:
-            return (
-                f"SHORT order: take_profit ({take_profit_price}) must be < "
-                f"stop_loss ({stop_loss_price})"
-            )
+        # SHORT: TP below entry/current, SL above
+        if tp >= sl:
+            return f"SHORT: take_profit ({tp}) must be < stop_loss ({sl})"
+        if entry and tp >= entry:
+            return f"SHORT: take_profit ({tp}) must be < entry ({entry})"
+        if entry and sl <= entry:
+            return f"SHORT: stop_loss ({sl}) must be > entry ({entry})"
     else:
         return f"side must be 'buy' or 'sell', got '{side}'"
 
@@ -382,212 +503,205 @@ def _validate_order_params(
 @retry_api()
 def place_bracket_order(
     symbol: str,
-    qty: int,
-    take_profit_price: float,
-    stop_loss_price: float,
+    qty: float,
+    tp: float,
+    sl: float,
     side: str = "buy",
-    time_in_force: str = "gtc",
-    limit_price: Optional[float] = None,
+    entry_price: float | None = None,
+    leverage: int = 5,
 ) -> OrderResult:
-    """Place a bracket order (entry + take-profit + stop-loss in one request).
+    """Place a bracket order: entry + stop-loss + take-profit.
+
+    If entry_price is given, uses a LIMIT entry. Otherwise MARKET.
+    SL and TP are placed as separate reduce-only orders after entry.
 
     Args:
-        symbol: Ticker symbol (e.g., "NVDA")
-        qty: Number of shares
-        take_profit_price: Take-profit limit price
-        stop_loss_price: Stop-loss trigger price
-        side: "buy" or "sell" (default "buy")
-        time_in_force: "day" or "gtc" (default "gtc" — preferred to avoid expiry)
-        limit_price: If provided, entry is a LIMIT order; otherwise MARKET
+        symbol: Trading pair (e.g., 'BTC/USDT:USDT')
+        qty: Position size in base currency (e.g., 0.01 BTC)
+        tp: Take-profit trigger price
+        sl: Stop-loss trigger price
+        side: 'buy' for LONG, 'sell' for SHORT
+        entry_price: Limit entry price (None = market order)
+        leverage: Leverage multiplier (default 5)
     """
-    err = _validate_order_params(qty, take_profit_price, stop_loss_price, side, limit_price)
+    err = _validate_bracket_params(qty, tp, sl, side, entry_price)
     if err:
         return OrderResult(success=False, error=f"Validation failed: {err}")
-    try:
-        client = get_trading_client()
-        order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-        tif = TimeInForce.GTC if time_in_force.lower() == "gtc" else TimeInForce.DAY
 
-        common = dict(
+    try:
+        exchange = get_exchange()
+
+        # Set leverage and margin mode first
+        set_leverage(symbol, leverage)
+        set_margin_mode(symbol, "isolated")
+
+        # Determine order type and close side for SL/TP
+        order_type = "limit" if entry_price else "market"
+        price = entry_price if entry_price else None
+        close_side = "sell" if side.lower() == "buy" else "buy"
+
+        # Step 1: Place entry order
+        order = exchange.create_order(
             symbol=symbol,
-            qty=qty,
-            side=order_side,
-            time_in_force=tif,
-            order_class=OrderClass.BRACKET,
-            take_profit={"limit_price": take_profit_price},
-            stop_loss={"stop_price": stop_loss_price},
-            client_order_id=f"ct_bracket_{symbol}_{int(time.time())}",
+            type=order_type,
+            side=side.lower(),
+            amount=qty,
+            price=price,
         )
 
-        if limit_price is not None:
-            order_data = LimitOrderRequest(
-                type=OrderType.LIMIT,
-                limit_price=limit_price,
-                **common,
-            )
-        else:
-            order_data = MarketOrderRequest(
-                type=OrderType.MARKET,
-                **common,
-            )
+        entry_id = str(order["id"])
+        entry_status = order.get("status", "unknown")
+        fill_price = entry_price or order.get("average") or order.get("price")
 
-        order = client.submit_order(order_data)
+        # Step 2: Place SL and TP as separate reduce-only orders
+        # (Binance Futures doesn't reliably link SL/TP to market entry via params)
+        sl_id = None
+        tp_id = None
+        protection_errors = []
 
-        legs = []
-        for leg in (order.legs or []):
-            legs.append({
-                "id": str(leg.id),
-                "type": str(leg.type),
-                "side": str(leg.side),
-                "limit_price": str(leg.limit_price) if leg.limit_price else None,
-                "stop_price": str(leg.stop_price) if leg.stop_price else None,
-                "status": str(leg.status),
-            })
+        try:
+            sl_order = exchange.create_order(
+                symbol=symbol, type="STOP_MARKET", side=close_side, amount=qty,
+                params={"stopPrice": sl, "reduceOnly": True},
+            )
+            sl_id = str(sl_order["id"])
+        except Exception as e:
+            protection_errors.append(f"SL failed: {e}")
+
+        try:
+            tp_order = exchange.create_order(
+                symbol=symbol, type="TAKE_PROFIT_MARKET", side=close_side, amount=qty,
+                params={"stopPrice": tp, "reduceOnly": True},
+            )
+            tp_id = str(tp_order["id"])
+        except Exception as e:
+            protection_errors.append(f"TP failed: {e}")
 
         return OrderResult(
             success=True,
-            order_id=str(order.id),
-            status=str(order.status),
-            legs=legs,
+            order_id=entry_id,
+            status=entry_status,
+            details={
+                "symbol": symbol,
+                "side": side,
+                "type": order_type,
+                "qty": qty,
+                "entry_price": fill_price,
+                "tp": tp,
+                "sl": sl,
+                "leverage": leverage,
+                "sl_order_id": sl_id,
+                "tp_order_id": tp_id,
+                "protection_errors": protection_errors or None,
+                "timestamp": order.get("datetime"),
+            },
         )
-    except APIError as e:
+    except ccxt.InsufficientFunds as e:
+        return OrderResult(success=False, error=f"Insufficient funds: {e}")
+    except ccxt.InvalidOrder as e:
+        return OrderResult(success=False, error=f"Invalid order: {e}")
+    except ccxt.ExchangeError as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
-        return OrderResult(success=False, error=f"API Error {e.status_code}: {e}")
+            raise
+        return OrderResult(success=False, error=f"Exchange error: {e}")
     except Exception as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
+            raise
         return OrderResult(success=False, error=str(e))
 
 
 @retry_api()
-def place_opg_order(
+def place_market_order(
     symbol: str,
-    qty: int,
+    qty: float,
     side: str = "buy",
-    limit_price: Optional[float] = None,
+    reduce_only: bool = False,
+    leverage: int = 5,
 ) -> OrderResult:
-    """Place a Market-on-Open (MOO) or Limit-on-Open (LOO) order.
-
-    Args:
-        symbol: Ticker symbol
-        qty: Number of shares
-        side: "buy" (long entry) or "sell" (short entry)
-        limit_price: If provided, entry is a LOO order; otherwise MOO
-    """
-    if qty <= 0:
-        return OrderResult(success=False, error=f"Validation failed: qty must be > 0, got {qty}")
-    if side.lower() not in ("buy", "sell"):
-        return OrderResult(success=False, error=f"Validation failed: side must be 'buy' or 'sell', got '{side}'")
-    if limit_price is not None and limit_price <= 0:
-        return OrderResult(success=False, error=f"Validation failed: limit_price must be > 0, got {limit_price}")
+    """Place a simple market order."""
     try:
-        client = get_trading_client()
-        order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-        if limit_price is not None:
-            order_data = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=order_side,
-                type=OrderType.LIMIT,
-                time_in_force=TimeInForce.OPG,
-                limit_price=limit_price,
-                client_order_id=f"ct_opg_{symbol}_{int(time.time())}",
-            )
-        else:
-            order_data = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=order_side,
-                type=OrderType.MARKET,
-                time_in_force=TimeInForce.OPG,
-                client_order_id=f"ct_opg_{symbol}_{int(time.time())}",
-            )
+        exchange = get_exchange()
+        if not reduce_only:
+            set_leverage(symbol, leverage)
+            set_margin_mode(symbol, "isolated")
 
-        order = client.submit_order(order_data)
+        params = {"reduceOnly": reduce_only}
+        order = exchange.create_order(
+            symbol=symbol,
+            type="market",
+            side=side.lower(),
+            amount=qty,
+            params=params,
+        )
         return OrderResult(
             success=True,
-            order_id=str(order.id),
-            status=str(order.status),
+            order_id=str(order["id"]),
+            status=order.get("status", "unknown"),
+            details={"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only},
         )
-    except APIError as e:
-        if _is_transient_error(e):
-            raise  # let retry_api handle it
-        return OrderResult(success=False, error=f"API Error {e.status_code}: {e}")
     except Exception as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
+            raise
         return OrderResult(success=False, error=str(e))
 
 
 @retry_api()
-def place_oco_order(
+def place_stop_order(
     symbol: str,
-    qty: int,
-    take_profit_price: float,
-    stop_loss_price: float,
+    qty: float,
+    trigger_price: float,
     side: str = "sell",
+    reduce_only: bool = True,
 ) -> OrderResult:
-    """Place an OCO (One-Cancels-Other) protection order after OPG fill.
-
-    Args:
-        symbol: Ticker symbol
-        qty: Number of shares
-        take_profit_price: Take-profit limit price
-        stop_loss_price: Stop-loss trigger price
-        side: "sell" to close a long, "buy" to cover a short
-    """
-    # OCO side is the EXIT side: sell closes long, buy covers short
-    # For sell (closing long): TP > SL (sell high = profit, sell low = stop)
-    # For buy (covering short): TP < SL (buy low = profit, buy high = stop)
-    err = _validate_order_params(
-        qty, take_profit_price, stop_loss_price,
-        # Invert validation: OCO sell = closing a long (validate as buy entry)
-        # OCO buy = covering a short (validate as sell entry)
-        side="buy" if side.lower() == "sell" else "sell",
-    )
-    if err:
-        return OrderResult(success=False, error=f"Validation failed: {err}")
+    """Place a stop-market order (typically for stop-loss)."""
     try:
-        client = get_trading_client()
-        order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-        order_data = LimitOrderRequest(
+        exchange = get_exchange()
+        order = exchange.create_order(
             symbol=symbol,
-            qty=qty,
-            side=order_side,
-            type=OrderType.LIMIT,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.OCO,
-            take_profit={"limit_price": take_profit_price},
-            stop_loss={"stop_price": stop_loss_price},
-            client_order_id=f"ct_oco_{symbol}_{int(time.time())}",
+            type="STOP_MARKET",
+            side=side.lower(),
+            amount=qty,
+            params={"stopPrice": trigger_price, "reduceOnly": reduce_only},
         )
-        order = client.submit_order(order_data)
-
-        legs = []
-        for leg in (order.legs or []):
-            legs.append({
-                "id": str(leg.id),
-                "type": str(leg.type),
-                "side": str(leg.side),
-                "limit_price": str(leg.limit_price) if leg.limit_price else None,
-                "stop_price": str(leg.stop_price) if leg.stop_price else None,
-                "status": str(leg.status),
-            })
-
         return OrderResult(
             success=True,
-            order_id=str(order.id),
-            status=str(order.status),
-            legs=legs,
+            order_id=str(order["id"]),
+            status=order.get("status"),
+            details={"type": "stop_market", "trigger": trigger_price},
         )
-    except APIError as e:
-        if _is_transient_error(e):
-            raise  # let retry_api handle it
-        return OrderResult(success=False, error=f"API Error {e.status_code}: {e}")
     except Exception as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
+            raise
+        return OrderResult(success=False, error=str(e))
+
+
+@retry_api()
+def place_tp_order(
+    symbol: str,
+    qty: float,
+    trigger_price: float,
+    side: str = "sell",
+    reduce_only: bool = True,
+) -> OrderResult:
+    """Place a take-profit-market order."""
+    try:
+        exchange = get_exchange()
+        order = exchange.create_order(
+            symbol=symbol,
+            type="TAKE_PROFIT_MARKET",
+            side=side.lower(),
+            amount=qty,
+            params={"stopPrice": trigger_price, "reduceOnly": reduce_only},
+        )
+        return OrderResult(
+            success=True,
+            order_id=str(order["id"]),
+            status=order.get("status"),
+            details={"type": "take_profit_market", "trigger": trigger_price},
+        )
+    except Exception as e:
+        if _is_transient_error(e):
+            raise
         return OrderResult(success=False, error=str(e))
 
 
@@ -596,107 +710,191 @@ def place_oco_order(
 # ---------------------------------------------------------------------------
 
 @retry_api()
-def close_position(symbol: str, percentage: Optional[float] = None) -> OrderResult:
-    """Close a position entirely or partially."""
+def close_position(symbol: str) -> OrderResult:
+    """Close an open position entirely."""
     try:
-        client = get_trading_client()
-        opts = ClosePositionRequest(percentage=percentage) if percentage else None
-        order = client.close_position(symbol, close_options=opts)
-        return OrderResult(
-            success=True,
-            order_id=str(order.id),
-            status=str(order.status),
+        positions = get_positions()
+        pos = next((p for p in positions if p["symbol"] == symbol), None)
+        if not pos:
+            return OrderResult(success=False, error=f"No open position on {symbol}")
+
+        close_side = "sell" if pos["side"] == "long" else "buy"
+        qty = pos["contracts"]
+
+        return place_market_order(
+            symbol=symbol,
+            qty=qty,
+            side=close_side,
+            reduce_only=True,
         )
-    except APIError as e:
-        if _is_transient_error(e):
-            raise  # let retry_api handle it
-        return OrderResult(success=False, error=f"API Error {e.status_code}: {e}")
     except Exception as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
+            raise
         return OrderResult(success=False, error=str(e))
 
 
 @retry_api()
-def cancel_order(order_id: str) -> bool:
+def cancel_order(order_id: str, symbol: str) -> bool:
     """Cancel an order by ID. Returns True if successful."""
     try:
-        get_trading_client().cancel_order_by_id(order_id)
+        get_exchange().cancel_order(order_id, symbol)
         return True
     except Exception as e:
         if _is_transient_error(e):
-            raise  # let retry_api handle it
+            raise
+        logger.warning("Failed to cancel order %s: %s", order_id, e)
         return False
 
 
+@retry_api()
+def cancel_all_orders(symbol: str) -> dict:
+    """Cancel all open orders for a symbol."""
+    try:
+        result = get_exchange().cancel_all_orders(symbol)
+        return {"success": True, "symbol": symbol, "cancelled": len(result) if isinstance(result, list) else 1}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
-# Historical orders & activities (for auto-improve analysis)
+# Historical data (for auto-improve analysis)
 # ---------------------------------------------------------------------------
 
 @retry_api()
-def get_closed_orders(days: int = 30, limit: int = 500) -> list[dict]:
+def get_closed_orders(symbol: str | None = None, days: int = 30, limit: int = 500) -> list[dict]:
     """Return closed/filled orders from the last N days."""
-    orders = get_trading_client().get_orders(
-        GetOrdersRequest(
-            status=QueryOrderStatus.CLOSED,
-            after=datetime.now(timezone.utc) - timedelta(days=days),
-            limit=limit,
-        )
-    )
-    results = []
-    for o in orders:
-        entry = {
-            "id": str(o.id),
-            "client_order_id": str(o.client_order_id) if o.client_order_id else None,
-            "symbol": o.symbol,
-            "side": str(o.side),
-            "qty": str(o.qty),
-            "filled_qty": str(o.filled_qty) if o.filled_qty else "0",
-            "type": str(o.type),
-            "order_class": str(o.order_class),
-            "status": str(o.status),
-            "filled_avg_price": float(o.filled_avg_price) if o.filled_avg_price else None,
-            "limit_price": float(o.limit_price) if o.limit_price else None,
-            "stop_price": float(o.stop_price) if o.stop_price else None,
-            "submitted_at": str(o.submitted_at) if o.submitted_at else None,
-            "filled_at": str(o.filled_at) if o.filled_at else None,
-            "expired_at": str(o.expired_at) if o.expired_at else None,
-            "canceled_at": str(o.canceled_at) if o.canceled_at else None,
-            "legs": [
-                {
-                    "id": str(leg.id),
-                    "type": str(leg.type),
-                    "side": str(leg.side),
-                    "qty": str(leg.qty),
-                    "filled_qty": str(leg.filled_qty) if leg.filled_qty else "0",
-                    "filled_avg_price": float(leg.filled_avg_price) if leg.filled_avg_price else None,
-                    "limit_price": float(leg.limit_price) if leg.limit_price else None,
-                    "stop_price": float(leg.stop_price) if leg.stop_price else None,
-                    "status": str(leg.status),
-                }
-                for leg in (o.legs or [])
-            ],
+    exchange = get_exchange()
+    since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+
+    all_orders = []
+    if symbol:
+        all_orders = exchange.fetch_closed_orders(symbol, since=since_ms, limit=limit)
+    else:
+        # Fetch for all active pairs
+        for pair in get_active_pairs():
+            try:
+                orders = exchange.fetch_closed_orders(pair, since=since_ms, limit=limit)
+                all_orders.extend(orders)
+            except Exception:
+                continue
+
+    return [
+        {
+            "id": str(o["id"]),
+            "symbol": o["symbol"],
+            "side": o["side"],
+            "type": o["type"],
+            "amount": float(o.get("amount", 0) or 0),
+            "filled": float(o.get("filled", 0) or 0),
+            "price": float(o.get("price", 0) or 0),
+            "average": float(o.get("average", 0) or 0),
+            "cost": float(o.get("cost", 0) or 0),
+            "status": o["status"],
+            "reduce_only": o.get("reduceOnly", False),
+            "timestamp": o.get("timestamp"),
+            "datetime": o.get("datetime"),
         }
-        results.append(entry)
-    return results
+        for o in all_orders
+    ]
 
 
 @retry_api()
-def get_portfolio_history(days: int = 30) -> dict:
-    """Return portfolio equity history for performance analysis."""
-    from alpaca.trading.requests import GetPortfolioHistoryRequest
+def get_trades(symbol: str, days: int = 30, limit: int = 500) -> list[dict]:
+    """Return trade history (fills) for a symbol."""
+    exchange = get_exchange()
+    since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=limit)
+    return [
+        {
+            "id": str(t["id"]),
+            "order_id": str(t.get("order", "")),
+            "symbol": t["symbol"],
+            "side": t["side"],
+            "amount": float(t["amount"]),
+            "price": float(t["price"]),
+            "cost": float(t["cost"]),
+            "fee": float(t["fee"]["cost"]) if t.get("fee") else 0,
+            "timestamp": t.get("timestamp"),
+            "datetime": t.get("datetime"),
+        }
+        for t in trades
+    ]
 
-    client = get_trading_client()
-    history = client.get_portfolio_history(
-        GetPortfolioHistoryRequest(
-            period=f"{days}D",
-            timeframe="1D",
-        )
-    )
-    return {
-        "timestamps": [str(t) for t in (history.timestamp or [])],
-        "equity": [float(e) for e in (history.equity or [])],
-        "profit_loss": [float(p) for p in (history.profit_loss or [])],
-        "profit_loss_pct": [float(p) for p in (history.profit_loss_pct or [])],
-        "base_value": float(history.base_value) if history.base_value else None,
-    }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Default pairs to trade (aggressive list)
+DEFAULT_PAIRS = [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "XRP/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+    "SUI/USDT:USDT",
+    "ARB/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "OP/USDT:USDT",
+    "FET/USDT:USDT",
+    "RENDER/USDT:USDT",
+    "INJ/USDT:USDT",
+    "WIF/USDT:USDT",
+    "PEPE/USDT:USDT",
+    "APT/USDT:USDT",
+    "ATOM/USDT:USDT",
+    "DOT/USDT:USDT",
+]
+
+
+def get_active_pairs() -> list[str]:
+    """Return list of active trading pairs."""
+    return DEFAULT_PAIRS
+
+
+def format_symbol(base: str) -> str:
+    """Format a base token into Binance Futures CCXT symbol.
+
+    Examples: 'BTC' → 'BTC/USDT:USDT', 'ETH' → 'ETH/USDT:USDT'
+    """
+    base = base.upper().strip()
+    if "/" in base:
+        return base  # already formatted
+    if base.endswith("USDT"):
+        base = base[:-4]
+    return f"{base}/USDT:USDT"
+
+
+def amount_precision(symbol: str) -> int:
+    """Get the amount precision (decimal places) for a symbol."""
+    try:
+        market = get_exchange().market(symbol)
+        prec = market["precision"]["amount"]
+        if prec is None:
+            return 3
+        # CCXT may return precision as decimal places (int) or tick size (float)
+        if isinstance(prec, int):
+            return prec
+        # Tick size format (e.g., 0.001 → 3 decimal places)
+        import math
+        return max(0, -int(math.log10(float(prec))))
+    except Exception:
+        return 3  # safe default
+
+
+def price_precision(symbol: str) -> int:
+    """Get the price precision (decimal places) for a symbol."""
+    try:
+        market = get_exchange().market(symbol)
+        prec = market["precision"]["price"]
+        if prec is None:
+            return 2
+        if isinstance(prec, int):
+            return prec
+        import math
+        return max(0, -int(math.log10(float(prec))))
+    except Exception:
+        return 2  # safe default
