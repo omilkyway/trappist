@@ -37,9 +37,4 @@ jobs:
         run: ruff check tests/ trading/ --select E,F --ignore E402
 
       - name: Run tests
-        env:
-          # Dummy credentials so alpaca-py doesn't crash on import
-          APCA_API_KEY_ID: "fake-key-for-ci"
-          APCA_API_SECRET_KEY: "fake-secret-for-ci"
-          ALPACA_PAPER_TRADE: "true"
         run: pytest tests/ -v --tb=short

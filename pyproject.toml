@@ -20,6 +20,16 @@ dev = [
     "ruff>=0.4.0",
 ]
 
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+"trading/indicators.py" = ["E741"]  # l = low is clear in context
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

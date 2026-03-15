@@ -317,7 +317,7 @@ def get_bars(
     timeframe: str = "4h",
     limit: int = 500,
     since: int | None = None,
-) -> "pd.DataFrame":
+):
     """Fetch OHLCV bars and return a pandas DataFrame.
 
     Args:

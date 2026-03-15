@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -174,7 +173,10 @@ def _build_error_embed(run_type: str, exit_code: int, error_msg: str = "") -> di
     return {
         "title": f"\U0001f6a8 TRAPPIST {run_type.upper()} FAILED",
         "color": COLOR_RED,
-        "description": f"Exit code: `{exit_code}`\n```\n{error_msg[:500]}\n```" if error_msg else f"Exit code: `{exit_code}`",
+        "description": (
+            f"Exit code: `{exit_code}`\n```\n{error_msg[:500]}\n```"
+            if error_msg else f"Exit code: `{exit_code}`"
+        ),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": "trappist v2.0 • error"},
     }
