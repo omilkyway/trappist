@@ -1,0 +1,22 @@
+[
+  {
+    "symbol": "CCL",
+    "qty": 113,
+    "direction": "SHORT",
+    "oco_side": "buy",
+    "tp": 23.00,
+    "sl": 28.65,
+    "opg_order_id": "d03222ee-7761-4ab2-a5ac-52050851c21a",
+    "session": "2026-03-09"
+  },
+  {
+    "symbol": "NEE",
+    "qty": 32,
+    "direction": "LONG",
+    "oco_side": "sell",
+    "tp": 96.00,
+    "sl": 89.50,
+    "opg_order_id": "be1708bf-9a74-4b92-ba70-732f7c84b352",
+    "session": "2026-03-09"
+  }
+]

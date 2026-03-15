@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "alpaca": {
+      "command": "/home/felaire/MILKY-WAY/DEV/AI/cc/claude-trading/alpaca-mcp-server/myvenv/bin/python",
+      "args": [
+        "/home/felaire/MILKY-WAY/DEV/AI/cc/claude-trading/alpaca-mcp-server/alpaca_mcp_server.py"
+      ],
+      "env": {
+        "ALPACA_API_KEY": "PKQZ3SWIN6J021B4NZCS",
+        "ALPACA_SECRET_KEY": "H82TcDIKgWBybb6d5Tf5OPHdM17znAa7cdRYCcku",
+        "ALPACA_PAPER_TRADE": "True"
+      }
+    },
+    "dappier": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://mcp.dappier.com/sse?apiKey=ak_01k3kn5kg4fcmvwebp86nck31q"]
+    }
+  }
+}
