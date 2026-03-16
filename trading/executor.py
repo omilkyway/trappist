@@ -72,18 +72,30 @@ def cmd_status(args):
         except Exception:
             pass
 
+    # Drawdown calculation
+    initial = state.get("initial_balance", 0)
+    equity = account["equity"]
+    drawdown_pct = round((equity - initial) / initial * 100, 2) if initial > 0 else 0
+
+    # Recent trade stats (last 20)
+    trades = state.get("trades", [])
+    recent = trades[-20:] if trades else []
+
     output = {
         "mode": "TESTNET" if is_sandbox() else "LIVE",
-        "equity": account["equity"],
+        "equity": equity,
         "free": account["free"],
         "exposure_pct": account["exposure_pct"],
         "unrealized_pnl": account["unrealized_pnl"],
+        "drawdown_pct": drawdown_pct,
         "positions": positions,
         "open_orders": len(orders),
         "unprotected": unprotected,
         "killed": state.get("killed", False),
-        "initial_balance": state.get("initial_balance", 0),
-        "total_trades": len(state.get("trades", [])),
+        "initial_balance": initial,
+        "total_trades": len(trades),
+        "recent_trades": len(recent),
+        "recent_symbols": list({t.get("symbol", "") for t in recent}),
     }
     print(json.dumps(output, indent=2))
     return 0
@@ -196,8 +208,56 @@ def cmd_bracket(args):
         entry_price=args.limit,
         leverage=args.leverage,
     )
+
+    # Persist trade to state.json for learning loop
+    if result.success:
+        _log_trade(result, symbol, side, args)
+
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.success else 1
+
+
+def _log_trade(result, symbol: str, side: str, args):
+    """Persist trade to state.json for continuous improvement."""
+    state_path = Path("state.json")
+    try:
+        state = json.load(open(state_path)) if state_path.exists() else {}
+    except Exception:
+        state = {}
+
+    # Init balance on first trade
+    if state.get("initial_balance", 0) == 0:
+        try:
+            account = get_account()
+            state["initial_balance"] = account["equity"]
+        except Exception:
+            pass
+
+    state.setdefault("trades", []).append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "order_id": result.order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": args.qty,
+        "entry": args.limit or result.details.get("entry_price"),
+        "sl": args.sl,
+        "tp": args.tp,
+        "rr": round(
+            abs(args.tp - (args.limit or result.details.get("entry_price", 0)))
+            / abs((args.limit or result.details.get("entry_price", 0)) - args.sl), 2
+        ) if args.sl != (args.limit or result.details.get("entry_price", 0)) else 0,
+        "leverage": args.leverage,
+        "sl_order_id": result.details.get("sl_order_id"),
+        "tp_order_id": result.details.get("tp_order_id"),
+        "protection_errors": result.details.get("protection_errors"),
+    })
+
+    # Keep last 200 trades
+    state["trades"] = state["trades"][-200:]
+    state["killed"] = state.get("killed", False)
+
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 # ---------------------------------------------------------------------------

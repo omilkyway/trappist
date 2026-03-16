@@ -114,6 +114,7 @@ if [[ -n "$S3_ENABLED" ]]; then
     log "Downloading state from S3..."
     aws s3 cp $S3_EP "$S3_BUCKET/progress.md" /app/progress.md 2>/dev/null || echo "# Trading Progress" > /app/progress.md
     aws s3 cp $S3_EP "$S3_BUCKET/pending_protections.json" /app/pending_protections.json 2>/dev/null || echo "[]" > /app/pending_protections.json
+    aws s3 cp $S3_EP "$S3_BUCKET/state.json" /app/state.json 2>/dev/null || echo '{"initial_balance":0,"killed":false,"trades":[]}' > /app/state.json
     aws s3 sync $S3_EP "$S3_BUCKET/reports/" /app/reports/ 2>/dev/null || true
 else
     log "S3 not configured — using ephemeral storage"
@@ -337,6 +338,7 @@ if [[ -n "$S3_ENABLED" ]]; then
     log "Uploading state to S3..."
     aws s3 cp $S3_EP /app/progress.md "$S3_BUCKET/progress.md" || log "WARNING: S3 upload progress.md failed"
     aws s3 cp $S3_EP /app/pending_protections.json "$S3_BUCKET/pending_protections.json" || log "WARNING: S3 upload pending_protections.json failed"
+    aws s3 cp $S3_EP /app/state.json "$S3_BUCKET/state.json" || log "WARNING: S3 upload state.json failed"
     aws s3 sync $S3_EP /app/reports/ "$S3_BUCKET/reports/" || log "WARNING: S3 sync reports failed"
     aws s3 sync $S3_EP /app/logs/ "$S3_BUCKET/logs/" --exclude "*.log" --include "${RUN_TYPE}-${TIMESTAMP}.log" --include "session_metrics_*.json" || log "WARNING: S3 sync logs failed"
     aws s3 rm $S3_EP "${S3_BUCKET}/.lock_${RUN_TYPE}" 2>/dev/null || true

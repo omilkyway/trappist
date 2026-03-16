@@ -14,19 +14,32 @@ You trade LONG when bullish, SHORT when bearish. Sitting out is the last resort.
 
 ## STEP 1 — INTEL (gather everything fast)
 
-### 1a. Portfolio state
+### 1a. Portfolio state + drawdown check
 ```bash
 source .venv/bin/activate && python trading/executor.py status
 ```
-If `killed: true` → STOP. Say "Bot is killed. Run /status for details."
+**Check these FIRST:**
+- If `killed: true` → STOP immediately.
+- If `drawdown_pct < -10` → Run `/kill` and STOP.
+- If `exposure_pct > 35` → Do NOT open new positions, only manage existing.
+- Read `recent_symbols` — avoid re-trading symbols you recently entered.
 
-### 1b. Protection check
+### 1b. Protection check + trail stops
 ```bash
 source .venv/bin/activate && python trading/executor.py protect --trail --max-days 10
 ```
 Fix any unprotected positions BEFORE looking for new trades. Trail profitable ones.
+TIME_STOP_WARNING = close that position before opening new ones.
 
-### 1c. Market regime — Fear & Greed Index
+### 1c. Learn from past trades
+Read state.json `trades` array. Ask yourself:
+- Am I repeatedly losing on the same symbols? → Avoid them.
+- Am I always going LONG? → Force yourself to find SHORT setups.
+- Are my SL getting hit too often? → Widen stops or improve entry timing.
+- Are my TP never reached? → Set more realistic targets.
+This 30-second reflection makes you a better trader every cycle.
+
+### 1d. Market regime — Fear & Greed Index
 Use MCP tool `mcp__fear-greed__get_current_fng_tool` to get current F&G.
 
 | F&G | Regime | Trading Style |
@@ -37,7 +50,7 @@ Use MCP tool `mcp__fear-greed__get_current_fng_tool` to get current F&G.
 | 10-25 | Fear | Quality longs on dips, aggressive shorts |
 | <10 | Extreme Fear | Only high-conviction longs, small size |
 
-### 1d. News & catalysts
+### 1e. News & catalysts
 Use MCP tools to gather breaking crypto intel:
 - `mcp__gloria-news__get_news_recap` — AI-curated crypto news summary
 - `mcp__gloria-news__get_latest_news` with category "bitcoin" or "market-analysis"
@@ -46,13 +59,13 @@ Use MCP tools to gather breaking crypto intel:
 Look for: regulatory news, exchange hacks, ETF flows, protocol upgrades, whale movements,
 token unlocks, macro events (Fed, CPI). Any of these can override technical signals.
 
-### 1e. Technical scan — ALL pairs
+### 1f. Technical scan — ALL pairs
 ```bash
 source .venv/bin/activate && python trading/executor.py scan --timeframe 4h
 ```
 This returns dual scores (long_score + short_score) + funding rate for 20 pairs.
 
-### 1f. Deep dive on top candidates
+### 1g. Deep dive on top candidates
 For the 3-5 pairs with highest scores, get additional context:
 - Use `mcp__tradingview__get_indicators` for confirmation on different timeframes
 - Use `mcp__gloria-news__get_ticker_summary` for pair-specific news
