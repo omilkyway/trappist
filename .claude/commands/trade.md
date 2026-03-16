@@ -21,7 +21,7 @@ source .venv/bin/activate && python trading/executor.py status
 **Check these FIRST:**
 - If `killed: true` → STOP immediately.
 - If `drawdown_pct < -10` → Run `/kill` and STOP.
-- If `exposure_pct > 35` → Do NOT open new positions, only manage existing.
+- If `exposure_pct > 70` → Slow down, manage existing before new trades.
 - Read `recent_symbols` — avoid re-trading symbols you recently entered.
 
 ### 1b. Protection check + trail stops
@@ -173,15 +173,27 @@ If 0 trades: still notify with "No signal" and explain why.
 
 ---
 
-## RULES (hardcoded, non-negotiable)
+## LIMITS (code-enforced, cannot be overridden)
+
+| Limit | Value | Enforced by |
+|-------|-------|-------------|
+| Max leverage | 20x (default 10x) | executor.py bracket |
+| Max positions | 8 concurrent | executor.py bracket |
+| Max exposure | 75% gross | executor.py bracket |
+| Max per category | 3 | categories.py |
+| Min R/R | 1.2 (default) | executor.py bracket |
+| Drawdown kill | -20% | risk_guardian.py hook |
+| Emergency SL | -10% from entry | executor.py protect |
+| Emergency TP | +15% from entry | executor.py protect |
+| Trail breakeven | at +5% PnL | executor.py protect --trail |
+| Trail distance | 5% from price | executor.py protect --trail |
+
+## RULES
 
 1. **ALWAYS** check protection before new trades
 2. **ALWAYS** SL + TP on every order
-3. **MAX** 10x leverage (default 5x)
-4. **MAX** 2% risk per trade, 5% notional per trade
-5. **MAX** 2 positions per category
-6. **MAX** 5 positions total, 40% gross exposure
-7. **KILL** if drawdown > 10% from initial balance
-8. If executor command fails → log it, move on, do NOT retry blindly
-9. **0 trades is acceptable** but should be rare — always explain why
-10. In doubt → smaller size, NOT no trade
+3. If executor command fails → log it, move on, do NOT retry blindly
+4. **0 trades is acceptable** but should be rare — always explain why
+5. In doubt → trade smaller, NOT skip
+6. **Be aggressive** — take meaningful positions that generate real P&L data
+7. **Learn from losses** — every loss is tuition if you analyze why

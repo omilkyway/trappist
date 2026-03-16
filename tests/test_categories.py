@@ -54,7 +54,7 @@ class TestCheckCategoryLimit:
     def test_empty_portfolio_allows(self):
         ok, reason = check_category_limit("BTC/USDT:USDT", [])
         assert ok
-        assert "0/2" in reason
+        assert "0/3" in reason
 
     def test_blocks_unknown_symbol(self):
         ok, reason = check_category_limit("FAKETOKEN", [])
@@ -71,16 +71,17 @@ class TestCheckCategoryLimit:
         positions = [
             {"symbol": "ETH/USDT:USDT"},
             {"symbol": "SOL/USDT:USDT"},
-        ]  # Both Smart Contract L1
-        ok, reason = check_category_limit("AVAX/USDT:USDT", positions)
+            {"symbol": "AVAX/USDT:USDT"},
+        ]  # 3 Smart Contract L1 = max
+        ok, reason = check_category_limit("SUI/USDT:USDT", positions)
         assert not ok
         assert "BLOCKED" in reason
         assert "Smart Contract L1" in reason
 
     def test_counts_pending_orders(self):
-        positions = [{"symbol": "ETH/USDT:USDT"}]
-        pending = [{"symbol": "SOL/USDT:USDT"}]
-        ok, _ = check_category_limit("AVAX/USDT:USDT", positions, pending)
+        positions = [{"symbol": "ETH/USDT:USDT"}, {"symbol": "SOL/USDT:USDT"}]
+        pending = [{"symbol": "AVAX/USDT:USDT"}]
+        ok, _ = check_category_limit("SUI/USDT:USDT", positions, pending)
         assert not ok
 
     def test_custom_max(self):
@@ -88,5 +89,5 @@ class TestCheckCategoryLimit:
         ok, _ = check_category_limit("SOL/USDT:USDT", positions, max_per_category=1)
         assert not ok
 
-    def test_default_max_is_two(self):
-        assert MAX_PER_CATEGORY == 2
+    def test_default_max_is_three(self):
+        assert MAX_PER_CATEGORY == 3

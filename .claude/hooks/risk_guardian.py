@@ -59,7 +59,7 @@ BASH_ORDER_PATTERNS = [
     r"ccxt\s+binance\s+create",
 ]
 
-DRAWDOWN_LIMIT = -0.05  # -5% for crypto (more volatile)
+DRAWDOWN_LIMIT = -0.20  # -20% hard kill — aggressive but not suicidal
 
 
 def _load_dotenv():

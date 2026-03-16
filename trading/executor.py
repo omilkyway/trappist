@@ -180,13 +180,13 @@ def cmd_scan(args):
             sl_tp = signals.get("suggested_sl_tp", {})
             price = signals["price"]
             if equity > 0 and price > 0 and sl_tp:
-                risk_amount = equity * 0.02
+                risk_amount = equity * 0.05  # 5% risk per trade (aggressive)
                 for direction in ("long", "short"):
                     levels = sl_tp.get(direction, {})
                     sl_dist = abs(price - levels.get("sl", price))
                     if sl_dist > 0:
                         suggested_qty = round(risk_amount / sl_dist, 6)
-                        max_qty = round(equity * 0.05 / price, 6)
+                        max_qty = round(equity * 0.15 / price, 6)  # 15% max notional
                         levels["suggested_qty"] = min(suggested_qty, max_qty)
                         levels["notional"] = round(levels["suggested_qty"] * price, 2)
 
@@ -216,20 +216,48 @@ def cmd_scan(args):
 # ---------------------------------------------------------------------------
 
 def cmd_bracket(args):
-    """Place bracket order with auto leverage + margin + R/R validation."""
+    """Place bracket order with auto leverage + margin + R/R validation.
+
+    Hard limits (code-enforced, cannot be overridden):
+    - Max leverage: 20x
+    - Max 8 concurrent positions
+    - Max 75% gross exposure
+    - Category concentration: 3 per category
+    """
     symbol = format_symbol(args.symbol)
     side = args.side.lower()
 
-    # Category check
+    # Hard limit: leverage cap
+    if args.leverage > 20:
+        print(json.dumps({"success": False, "error": f"Leverage {args.leverage}x > max 20x"}, indent=2))
+        return 1
+
+    # Hard limits: positions count + exposure
     try:
         positions = get_positions()
         orders = get_open_orders()
+        account = get_account()
+
+        # Max 8 concurrent positions
+        if len(positions) >= 8:
+            print(json.dumps({"success": False, "error": f"Max 8 positions ({len(positions)} open)"}, indent=2))
+            return 1
+
+        # Max 75% gross exposure
+        if account["exposure_pct"] > 75:
+            print(json.dumps({
+                "success": False,
+                "error": f"Exposure {account['exposure_pct']:.1f}% > max 75%",
+            }, indent=2))
+            return 1
+
+        # Category check
         allowed, reason = check_category_limit(symbol, positions, orders)
         if not allowed:
             print(json.dumps({"success": False, "error": reason}, indent=2))
             return 1
     except Exception as e:
-        print(json.dumps({"success": False, "error": f"Category check failed: {e}"}, indent=2))
+        print(json.dumps({"success": False, "error": f"Pre-trade checks failed: {e}"}, indent=2))
         return 1
 
     # R/R validation with live price
@@ -417,15 +445,15 @@ def cmd_protect(args):
             for o in orders
         )
 
-        # Fix missing protection (emergency 7% SL, 10% TP)
+        # Fix missing protection (emergency 10% SL, 15% TP — wide to let trades breathe)
         if not has_sl:
-            sl_price = round(entry * (0.93 if side == "long" else 1.07), 2)
+            sl_price = round(entry * (0.90 if side == "long" else 1.10), 2)
             result = place_stop_order(sym, contracts, sl_price, side=close_side)
             actions.append({"symbol": sym, "action": "EMERGENCY_SL", "price": sl_price,
                            "success": result.success, "error": result.error})
 
         if not has_tp:
-            tp_price = round(entry * (1.10 if side == "long" else 0.90), 2)
+            tp_price = round(entry * (1.15 if side == "long" else 0.85), 2)
             result = place_tp_order(sym, contracts, tp_price, side=close_side)
             actions.append({"symbol": sym, "action": "EMERGENCY_TP", "price": tp_price,
                            "success": result.success, "error": result.error})
@@ -454,19 +482,19 @@ def cmd_protect(args):
                 current_sl = sl_order["stop_price"]
                 new_sl = None
 
-                if side == "long" and pnl_pct >= 5.0:
-                    new_sl = round(current * 0.97, 2)  # Trail at 3%
+                if side == "long" and pnl_pct >= 8.0:
+                    new_sl = round(current * 0.95, 2)  # Trail at 5%
                     if new_sl <= current_sl:
                         new_sl = None
-                elif side == "long" and pnl_pct >= 3.0:
+                elif side == "long" and pnl_pct >= 5.0:
                     new_sl = entry  # Breakeven
                     if new_sl <= current_sl:
                         new_sl = None
-                elif side == "short" and pnl_pct >= 5.0:
-                    new_sl = round(current * 1.03, 2)
+                elif side == "short" and pnl_pct >= 8.0:
+                    new_sl = round(current * 1.05, 2)
                     if new_sl >= current_sl:
                         new_sl = None
-                elif side == "short" and pnl_pct >= 3.0:
+                elif side == "short" and pnl_pct >= 5.0:
                     new_sl = entry
                     if new_sl >= current_sl:
                         new_sl = None
@@ -524,8 +552,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("sl", type=float, help="Stop-loss price")
     b.add_argument("--side", default="buy", choices=["buy", "sell"], help="buy=LONG, sell=SHORT")
     b.add_argument("--limit", type=float, default=None, help="Limit entry price (None=market)")
-    b.add_argument("--leverage", type=int, default=5, help="Leverage (default: 5)")
-    b.add_argument("--min-rr", type=float, default=1.5, help="Min R/R ratio (default: 1.5)")
+    b.add_argument("--leverage", type=int, default=10, help="Leverage (default: 10, max 20)")
+    b.add_argument("--min-rr", type=float, default=1.2, help="Min R/R ratio (default: 1.2)")
     b.add_argument("--no-validate", action="store_true", help="Skip R/R validation")
 
     c = sub.add_parser("close", help="Close position + cancel orders")

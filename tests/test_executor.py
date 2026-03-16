@@ -73,7 +73,7 @@ class TestCLIParsing:
         assert args.tp == 76000.0
         assert args.sl == 71000.0
         assert args.side == "buy"  # default
-        assert args.leverage == 5  # default
+        assert args.leverage == 10  # default (aggressive)
 
     def test_bracket_short(self):
         args = self.parser.parse_args([

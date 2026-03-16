@@ -75,7 +75,7 @@ CATEGORY_MAP: dict[str, str] = {
 }
 
 # Maximum trades per category (enforced programmatically)
-MAX_PER_CATEGORY = 2
+MAX_PER_CATEGORY = 3
 
 
 def normalize_symbol(symbol: str) -> str:
