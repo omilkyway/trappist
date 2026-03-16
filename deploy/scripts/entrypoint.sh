@@ -126,8 +126,8 @@ fi
 # 2. RECONCILE (prevents phantom position blocking)
 # ==================================================================
 if [[ "$RUN_TYPE" == "cycle" ]]; then
-    log "Reconciling progress.md with live Binance Futures positions..."
-    /app/.venv/bin/python /app/trading/executor.py reconcile 2>&1 || log "WARNING: Reconciliation failed (non-fatal)"
+    log "Reconciling: fix protection + sync state..."
+    /app/.venv/bin/python /app/trading/executor.py protect 2>&1 || log "WARNING: Reconciliation failed (non-fatal)"
 fi
 
 # ==================================================================
@@ -195,13 +195,13 @@ is_auth_error() {
 if [[ "$RUN_TYPE" == "protect" ]]; then
     # Lightweight — no LLM needed.
     set +e
-    log "Phase 1: Check protection on all positions..."
-    /app/.venv/bin/python /app/trading/executor.py check-protection \
+    log "Phase 1: Check + fix protection on all positions..."
+    /app/.venv/bin/python /app/trading/executor.py protect \
         2>&1 | tee "/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
     EXIT_CODE=${PIPESTATUS[0]}
 
-    log "Phase 2: Trailing stops adjustment..."
-    /app/.venv/bin/python /app/trading/executor.py trail-stops \
+    log "Phase 2: Trail profitable stops..."
+    /app/.venv/bin/python /app/trading/executor.py protect --trail \
         2>&1 | tee -a "/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
     set -e
 else

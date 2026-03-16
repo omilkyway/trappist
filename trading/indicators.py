@@ -259,6 +259,169 @@ def adr(
 
 
 # ---------------------------------------------------------------------------
+# ADX (Average Directional Index) — trend strength + direction
+# ---------------------------------------------------------------------------
+
+def compute_adx(
+    high: pd.Series | pd.DataFrame,
+    low: pd.Series | pd.DataFrame,
+    close: pd.Series | pd.DataFrame,
+    period: int = 14,
+) -> pd.DataFrame:
+    """Average Directional Index with +DI and -DI.
+
+    ADX measures trend STRENGTH (not direction): >25 = trending, <20 = ranging.
+    +DI vs -DI gives trend DIRECTION.
+    """
+    h = _ensure_series(high, "high")
+    l = _ensure_series(low, "low")
+    c = _ensure_series(close, "close")
+
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+
+    up_move = h.diff()
+    down_move = -l.diff()
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=h.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=h.index,
+    )
+
+    alpha = 1.0 / period
+    tr_smooth = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    plus_dm_s = plus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    minus_dm_s = minus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+    tr_safe = tr_smooth.replace(0, np.nan)
+    plus_di = (100 * plus_dm_s / tr_safe).fillna(0)
+    minus_di = (100 * minus_dm_s / tr_safe).fillna(0)
+
+    di_sum_safe = (plus_di + minus_di).replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / di_sum_safe).fillna(0)
+    adx_val = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+    return pd.DataFrame({"adx": adx_val, "plus_di": plus_di, "minus_di": minus_di}, index=c.index)
+
+
+# ---------------------------------------------------------------------------
+# Chandelier Exit — ATR-based trailing stop (superior to fixed %)
+# ---------------------------------------------------------------------------
+
+def chandelier_exit(
+    high: pd.Series | pd.DataFrame,
+    low: pd.Series | pd.DataFrame,
+    close: pd.Series | pd.DataFrame,
+    lookback: int = 22,
+    multiplier: float = 3.0,
+) -> pd.DataFrame:
+    """Chandelier Exit — volatility-adaptive trailing stop.
+
+    Long exit:  Highest High(lookback) - ATR(14) x multiplier
+    Short exit: Lowest Low(lookback) + ATR(14) x multiplier
+
+    For crypto use multiplier 3.0 (standard) to 5.0 (wide).
+    """
+    h = _ensure_series(high, "high")
+    l = _ensure_series(low, "low")
+
+    atr_val = atr(high, low, close, period=14)
+    highest = h.rolling(window=lookback, min_periods=lookback).max()
+    lowest = l.rolling(window=lookback, min_periods=lookback).min()
+
+    return pd.DataFrame({
+        "long_exit": highest - multiplier * atr_val,
+        "short_exit": lowest + multiplier * atr_val,
+    }, index=h.index)
+
+
+# ---------------------------------------------------------------------------
+# Bollinger Squeeze — breakout imminent detector
+# ---------------------------------------------------------------------------
+
+def bollinger_squeeze(
+    close: pd.Series | pd.DataFrame,
+    period: int = 20,
+    num_std: float = 2.0,
+    lookback: int = 120,
+) -> dict:
+    """Detect Bollinger Band squeeze — bandwidth at local minimum.
+
+    Squeeze = bandwidth in bottom 20th percentile over lookback.
+    Breakout direction unknown — wait for candle close beyond band.
+    """
+    s = _ensure_series(close)
+    bb = bollinger_bands(s, period, num_std)
+    bw = bb["bandwidth"]
+
+    last_idx = len(bw) - 1
+    if last_idx < lookback or pd.isna(bw.iloc[last_idx]):
+        return {"bandwidth": None, "bandwidth_percentile": None, "is_squeeze": False}
+
+    recent = bw.iloc[max(0, last_idx - lookback):last_idx + 1].dropna()
+    if len(recent) < 20:
+        return {"bandwidth": None, "bandwidth_percentile": None, "is_squeeze": False}
+
+    current = float(bw.iloc[last_idx])
+    pctile = round(float((recent < current).sum()) / len(recent) * 100, 1)
+
+    return {"bandwidth": round(current, 6), "bandwidth_percentile": pctile, "is_squeeze": pctile < 20}
+
+
+# ---------------------------------------------------------------------------
+# Volatility-adaptive leverage — keeps risk per trade constant
+# ---------------------------------------------------------------------------
+
+def suggest_leverage(
+    atr_pct: float | None,
+    sl_atr_mult: float = 2.0,
+    safety_factor: float = 0.5,
+    max_leverage: int = 20,
+    min_leverage: int = 3,
+) -> int:
+    """Calculate max safe leverage from volatility.
+
+    Constraint: liquidation must be FURTHER than SL.
+    Formula: leverage = safety_factor / (atr_pct x sl_atr_mult)
+
+    safety_factor 0.5 = 50% buffer between SL and liquidation.
+
+    ATR 1% → 20x (cap) | ATR 2% → 12x | ATR 3% → 8x | ATR 5% → 5x
+    """
+    if not atr_pct or atr_pct <= 0:
+        return 5
+    sl_pct = atr_pct * sl_atr_mult
+    optimal = safety_factor / sl_pct
+    return max(min_leverage, min(max_leverage, round(optimal)))
+
+
+# ---------------------------------------------------------------------------
+# Regime classifier — determines WHICH strategy to use
+# ---------------------------------------------------------------------------
+
+def classify_regime(adx_value: float | None) -> dict:
+    """Classify market regime from ADX.
+
+    ranging (ADX<20): mean reversion, Bollinger bounces
+    transitioning (20-25): reduce size, wait for clarity
+    trending (25-50): trend following, breakouts, momentum
+    strong_trend (>50): trail existing positions, don't initiate new
+    """
+    if adx_value is None:
+        return {"regime": "unknown", "adx": None, "strategy": "reduce_size"}
+    adx_r = round(adx_value, 1)
+    if adx_value >= 50:
+        return {"regime": "strong_trend", "adx": adx_r, "strategy": "trail_only"}
+    if adx_value >= 25:
+        return {"regime": "trending", "adx": adx_r, "strategy": "trend_follow"}
+    if adx_value >= 20:
+        return {"regime": "transitioning", "adx": adx_r, "strategy": "reduce_size"}
+    return {"regime": "ranging", "adx": adx_r, "strategy": "mean_revert"}
+
+
+# ---------------------------------------------------------------------------
 # Composite signal scoring (matches technical-analyst agent spec)
 # ---------------------------------------------------------------------------
 
@@ -273,8 +436,8 @@ _SIGNAL_WEIGHTS = {
     "price_sma200":  (+2, -2),
 }
 
-_MAX_RAW = 24   # 16 base + 5 independent directional bonuses + 3 funding rate
-_MIN_RAW = -19   # -16 base - 3 funding rate
+_MAX_RAW = 27   # 16 base + 5 independent + 3 funding + 3 ADX trend boost
+_MIN_RAW = -21   # -16 base - 3 funding - 2 ADX ranging dampen
 
 
 def _score_to_metrics(raw: int) -> dict:
@@ -491,6 +654,27 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
         long_raw += funding_info["long_score"]
         short_raw += funding_info["short_score"]
 
+    # --- ADX REGIME SCORING ---
+    adx_data = compute_adx(high, low, close)
+    adx_last = _safe(adx_data["adx"].iloc[last])
+    plus_di_last = _safe(adx_data["plus_di"].iloc[last])
+    minus_di_last = _safe(adx_data["minus_di"].iloc[last])
+
+    if adx_last is not None:
+        if adx_last > 40 and plus_di_last is not None and minus_di_last is not None:
+            # Strong trend — boost dominant direction
+            if plus_di_last > minus_di_last:
+                long_raw += 3
+            else:
+                short_raw += 3
+        elif adx_last < 20:
+            # Ranging — dampen both (fewer, lower-quality trades)
+            long_raw -= 2
+            short_raw -= 2
+
+    regime = classify_regime(adx_last)
+    squeeze = bollinger_squeeze(close)
+
     long_m = _score_to_metrics(long_raw)
     short_m = _score_to_metrics(short_raw)
 
@@ -507,19 +691,36 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
     adr_last = _r(adr_val.iloc[last]) if not pd.isna(adr_val.iloc[last]) else None
     atr_last = _r(atr_val.iloc[last])
 
-    # Compute suggested SL/TP for both directions
+    # Compute suggested SL/TP — ATR-based (primary) with pivot adjustment
+    # Research: 2x ATR SL, 4x ATR TP = 2.0 R/R minimum
     sl_tp = {}
-    if atr_last:
-        # LONG levels
-        long_sl = levels["support_1"] if levels["support_1"] else round(price - 2 * atr_last, 2)
-        long_tp = levels["resistance_1"] if levels["resistance_1"] else round(price + 1.5 * (price - long_sl), 2)
+    atr_pct = atr_last / price if price > 0 and atr_last else None
+    if atr_last and price > 0:
+        sl_mult = 2.0   # 2x ATR stop-loss (consensus for crypto)
+        tp_mult = 4.0   # 4x ATR take-profit (2.0 R/R minimum)
+
+        # LONG — ATR-based with pivot structure adjustment
+        long_sl = round(price - sl_mult * atr_last, 2)
+        long_tp = round(price + tp_mult * atr_last, 2)
+        # Tighten SL to support if nearby (within 1 ATR)
+        if levels["support_1"] and abs(levels["support_1"] - long_sl) < atr_last:
+            long_sl = round(min(long_sl, levels["support_1"]), 2)
+        # Extend TP to resistance if further (let winners run)
+        if levels["resistance_1"] and levels["resistance_1"] > long_tp:
+            long_tp = round(levels["resistance_1"], 2)
+
         long_sl_pct = round((long_sl - price) / price * 100, 2)
         long_tp_pct = round((long_tp - price) / price * 100, 2)
         long_rr = round(abs(long_tp_pct / long_sl_pct), 2) if long_sl_pct != 0 else 0
 
-        # SHORT levels
-        short_sl = levels["resistance_1"] if levels["resistance_1"] else round(price + 2 * atr_last, 2)
-        short_tp = levels["support_1"] if levels["support_1"] else round(price - 1.5 * (short_sl - price), 2)
+        # SHORT — ATR-based with pivot structure adjustment
+        short_sl = round(price + sl_mult * atr_last, 2)
+        short_tp = round(price - tp_mult * atr_last, 2)
+        if levels["resistance_1"] and abs(levels["resistance_1"] - short_sl) < atr_last:
+            short_sl = round(max(short_sl, levels["resistance_1"]), 2)
+        if levels["support_1"] and levels["support_1"] < short_tp:
+            short_tp = round(levels["support_1"], 2)
+
         short_sl_pct = round((short_sl - price) / price * 100, 2)
         short_tp_pct = round((short_tp - price) / price * 100, 2)
         short_rr = round(abs(short_tp_pct / short_sl_pct), 2) if short_sl_pct != 0 else 0
@@ -528,6 +729,11 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
             "long": {"sl": long_sl, "tp": long_tp, "sl_pct": long_sl_pct, "tp_pct": long_tp_pct, "rr": long_rr},
             "short": {"sl": short_sl, "tp": short_tp, "sl_pct": short_sl_pct, "tp_pct": short_tp_pct, "rr": short_rr},
         }
+
+    # Chandelier Exit levels for trailing
+    ce = chandelier_exit(high, low, close)
+    ce_long = _r(ce["long_exit"].iloc[last])
+    ce_short = _r(ce["short_exit"].iloc[last])
 
     return {
         "price": round(price, 2),
@@ -544,12 +750,20 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
             "bollinger_lower": _r(bb["lower"].iloc[last]),
             "bollinger_pct_b": _r(pct_b, 3),
             "atr14": atr_last,
+            "atr_pct": _r(atr_pct * 100, 4) if atr_pct else None,
             "adr14": adr_last,
             "volume_ratio": _r(vr),
             "sma200": _r(sma200_val) if sma200_val is not None else None,
+            "adx": _r(adx_last, 1),
+            "plus_di": _r(plus_di_last, 1),
+            "minus_di": _r(minus_di_last, 1),
         },
         "levels": levels,
         "suggested_sl_tp": sl_tp,
+        "regime": regime,
+        "squeeze": squeeze,
+        "chandelier_exit": {"long_trail": ce_long, "short_trail": ce_short},
+        "suggested_leverage": suggest_leverage(atr_pct),
         "signals": {
             "long_score": long_m["normalized_score"],
             "long_direction": long_m["direction"],

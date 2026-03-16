@@ -38,16 +38,19 @@ Always search before trading — breaking news overrides technicals.
 
 | Limit | Value | Cannot be overridden |
 |-------|-------|---------------------|
-| Max leverage | **20x** (default 10x) | executor.py |
+| Max leverage | **20x** (use scan's `suggested_leverage`) | executor.py |
 | Max positions | **8** concurrent | executor.py |
 | Max exposure | **75%** gross | executor.py |
 | Max per category | **3** | categories.py |
-| Min R/R | **1.2** | executor.py |
+| Min R/R | **1.5** (code) / **2.0** (target) | executor.py |
+| Risk per trade | **2%** equity (Half-Kelly) | executor.py scan |
+| Cooldown | **60 min** per symbol | executor.py |
 | Drawdown kill | **-20%** | risk_guardian.py |
-| Emergency SL | **-10%** from entry | executor.py protect |
-| Emergency TP | **+15%** from entry | executor.py protect |
-| Trail to breakeven | at **+5%** PnL | executor.py protect |
-| Trail distance | **5%** from price | executor.py protect |
+| SL distance | **2x ATR** (volatility-adaptive) | indicators.py |
+| TP distance | **4x ATR** (2.0 R/R minimum) | indicators.py |
+| Emergency SL | leverage-aware (max 50% margin loss) | executor.py protect |
+| Trail method | **Chandelier Exit** (3x ATR from high) | executor.py protect |
+| Trail activation | at **+3%** PnL | executor.py protect |
 
 ## Sizing (from scan output)
 
@@ -58,6 +61,38 @@ capped at: equity × 15% / price
 ```
 
 The scan calculates `suggested_qty` — USE IT, don't invent sizes.
+- **Tier A (high conviction, score > 65)**: full `suggested_qty`, 10x leverage
+- **Tier B (moderate, score 55-65)**: 50% of `suggested_qty`, 5x leverage
+- **Tier C (weak, score < 55)**: DO NOT TRADE
+
+## Strategy Playbook (research-validated + data-driven)
+
+**Core edge: Adaptive risk management**
+- ATR-based everything: SL (2×ATR), TP (4×ATR), trail (Chandelier 3×ATR), leverage (volatility-inverse)
+- Multi-timeframe: only trade when 1h + 4h align (+15-25% win rate vs single TF)
+- Regime detection: ADX > 25 = trend-follow, ADX < 20 = skip or mean revert
+
+**Position sizing: Half-Kelly (2% risk per trade)**
+- Formula: qty = (equity × 2%) / SL_distance
+- Capped at 12% notional per position
+- Leverage = 2% / (ATR% × 2) — automatically adapts to volatility
+
+**What works (from trade data + research):**
+- Early momentum entries when ADX > 25 and multi-TF aligned = 65%+ win rate
+- Chandelier Exit trailing captures 3-7% moves (ATR-adaptive)
+- Bollinger squeeze → breakout = highest R/R setups (3:1+)
+- AI category (FET, RENDER) and L1 (DOT, SOL) are the best performers
+
+**What loses money:**
+- Trading in ranging regime (ADX < 20) = noise, not signal
+- Re-entering exhausted moves (cooldown now prevents this)
+- Fixed leverage ignoring volatility (high vol + high lev = disaster)
+- Low R/R trades (< 1.5) barely break even after fees at 40% win rate
+
+**Timing:**
+- Cycle runs every 15 min with 60 min cooldown per symbol
+- Scan provides multi-TF + regime + squeeze + suggested leverage
+- 0 trades per cycle is NORMAL in ranging markets — it's not a missed opportunity
 
 ## Categories (max 3 per category)
 

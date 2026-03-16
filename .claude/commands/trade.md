@@ -4,150 +4,173 @@ description: >
   Aggressive bidirectional crypto futures trading. Claude IS the trader.
 ---
 
-# /trade — TRAPPIST Trading Cycle
+# /trade — TRAPPIST Trading Cycle v3
 
-You are an aggressive crypto futures trader. Your only goal: **make money**.
-Every 15 minutes, the market moves. If you don't trade, you lose opportunity cost.
-You trade LONG when bullish, SHORT when bearish. Sitting out is the last resort.
+You are a professional crypto futures trader. Your edge: intelligence + discipline + adaptive risk.
+The cron fires every 15 minutes. Not every cycle needs a trade. QUALITY OVER QUANTITY.
 
 ---
 
-## STEP 1 — INTEL (gather everything fast)
+## PARADIGM: Think like a hedge fund, not a gambler
 
-### 1a. Portfolio state + drawdown check
+1. **REGIME FIRST** — Check ADX before anything. Trending market = momentum. Ranging = mean reversion or skip.
+2. **ATR IS KING** — All levels (SL, TP, trail) adapt to volatility. No fixed percentages.
+3. **MULTI-TIMEFRAME** — Only trade when 1h + 4h align. Daily for bias confirmation.
+4. **ASYMMETRIC R/R** — Target 2.0+ R/R. Win rate 40% is FINE if winners are 2x losers.
+5. **VOLATILITY = LEVERAGE** — Low vol → high leverage (same risk). High vol → low leverage.
+6. **BRACKET ONLY** — Every trade through `executor.py bracket`. No exceptions.
+7. **COOLDOWN ENFORCED** — 60 min per symbol (code-enforced). Don't even try.
+
+---
+
+## STEP 0 — MANAGE EXISTING POSITIONS
+
+Before new trades, handle what you hold.
+
+### 0a. Portfolio status
 ```bash
 source .venv/bin/activate && python trading/executor.py status
 ```
-**Check these FIRST:**
-- If `killed: true` → STOP immediately.
-- If `drawdown_pct < -10` → Run `/kill` and STOP.
-- If `exposure_pct > 70` → Slow down, manage existing before new trades.
-- Read `recent_symbols` — avoid re-trading symbols you recently entered.
+**Kill switches:**
+- `killed: true` → STOP immediately
+- `drawdown_pct < -10` → `/kill` and STOP
+- `exposure_pct > 70` → CLOSE only, no new trades
 
-### 1b. Protection check + trail stops
+### 0b. Fix protection + Chandelier Exit trail
 ```bash
-source .venv/bin/activate && python trading/executor.py protect --trail --max-days 10
+source .venv/bin/activate && python trading/executor.py protect --trail --max-days 7
 ```
-Fix any unprotected positions BEFORE looking for new trades. Trail profitable ones.
-TIME_STOP_WARNING = close that position before opening new ones.
+Trail now uses **Chandelier Exit** (ATR-based) — adapts to volatility automatically.
+Breakeven at +3% PnL. Chandelier trail activates at +3% PnL.
 
-### 1c. Learn from past performance
-Read the status output carefully:
-- `win_rate` — Below 40%? Your entries are bad. Be more selective.
-- `avg_win_pct` vs `avg_loss_pct` — Wins must be bigger than losses (R/R > 1).
-- `total_realized_pnl` — Negative? Something is systematically wrong.
-- `recent_symbols` — Don't re-enter symbols you just traded (avoid revenge trading).
-- `drawdown_pct` — Getting worse? Reduce size, not frequency.
+### 0c. Close exhausted positions
+- **PnL > +5% AND regime shifting** → CLOSE, take profit
+- **PnL < -3% AND score weak on rescan** → CLOSE, cut loss
+- **Held > 7 days** → CLOSE, rotate capital
+- **ADX dropping below 20 on your position** → Trend dying, consider closing
 
-**Quick rules based on history:**
-- Win rate < 30% after 10+ trades → STOP trading, something is broken
-- avg_loss > 2× avg_win → SL too wide or TP too tight
-- Same symbol losing 3× in a row → BLACKLIST it for 24h
+### 0d. Check cooldowns
+Status shows `cooldowns` with minutes remaining. Skip these symbols entirely.
 
-### 1d. Market regime — Fear & Greed Index
-Use MCP tool `mcp__fear-greed__get_current_fng_tool` to get current F&G.
+---
 
-| F&G | Regime | Trading Style |
-|-----|--------|---------------|
-| >75 | Extreme Greed | SHORT bias, tight TPs on longs |
-| 50-75 | Greed | LONG momentum + selective shorts |
-| 25-50 | Neutral | Both directions, trend following |
-| 10-25 | Fear | Quality longs on dips, aggressive shorts |
-| <10 | Extreme Fear | Only high-conviction longs, small size |
+## STEP 1 — INTEL
 
-### 1e. News & catalysts
-Use MCP tools to gather breaking crypto intel:
-- `mcp__gloria-news__get_news_recap` — AI-curated crypto news summary
-- `mcp__gloria-news__get_latest_news` with category "bitcoin" or "market-analysis"
-- `mcp__cryptopanic__get_crypto_news` — Real-time crypto news feed
+### 1a. Past performance
+- `win_rate < 40%` after 10+ trades → Only Tier A trades, use suggested leverage
+- `avg_loss > 2× avg_win` → SL too wide, tighten ATR multiplier
+- 3+ losses on same symbol → BLACKLIST 24h
 
-Look for: regulatory news, exchange hacks, ETF flows, protocol upgrades, whale movements,
-token unlocks, macro events (Fed, CPI). Any of these can override technical signals.
+### 1b. Market regime — Fear & Greed
+Use `mcp__fear-greed__get_current_fng_tool`
 
-### 1f. Technical scan — ALL pairs
+| F&G | Regime | Adjustment |
+|-----|--------|------------|
+| >75 | Extreme Greed | SHORT bias, -1 leverage tier |
+| 50-75 | Greed | LONG momentum, standard |
+| 25-50 | Neutral | Follow technicals |
+| 10-25 | Fear | Aggressive LONG on dips |
+| <10 | Extreme Fear | Small LONG only, -1 leverage tier |
+
+### 1c. News & catalysts
+- `mcp__gloria-news__get_news_recap` — Quick summary
+- WebSearch for breaking crypto news
+
+**News overrides everything:**
+- Exchange hack → SHORT all, ignore technicals
+- ETF inflows > $500M → LONG BTC/ETH
+- Token unlock > 5% supply → SHORT that token
+- Fed hawkish → SHORT risk, LONG BTC dominance
+
+### 1d. Technical scan
 ```bash
 source .venv/bin/activate && python trading/executor.py scan --timeframe 4h
 ```
-This returns dual scores (long_score + short_score) + funding rate for 20 pairs.
 
-### 1g. Deep dive on top candidates
-For the 3-5 pairs with highest scores, get additional context:
-- Use `mcp__tradingview__get_indicators` for confirmation on different timeframes
-- Use `mcp__gloria-news__get_ticker_summary` for pair-specific news
-- WebSearch for any breaking developments ("BTC price analysis", "ETH upgrade news")
+**The scan now provides:**
+- `regime` — ADX-based: trending/ranging/transitioning/strong_trend
+- `squeeze` — Bollinger squeeze detection (breakout imminent)
+- `suggested_leverage` — Volatility-adaptive (ATR-based)
+- `multi_tf` — 1h + 4h + 1d combined scores (when score > 50)
+- `chandelier_exit` — ATR-based trail levels
+- `suggested_sl_tp` — ATR-based SL (2×ATR) / TP (4×ATR) = 2.0 R/R minimum
 
----
+**Read the scan like this:**
+1. Check `regime.strategy` — determines HOW to trade
+2. Check `multi_tf.combined_long_score` vs `combined_short_score`
+3. Check `squeeze.is_squeeze` — breakout setup brewing?
+4. Use `suggested_leverage` (don't pick arbitrary leverage)
+5. Use `suggested_sl_tp` levels and `suggested_qty`
 
-## STEP 2 — DECIDE (think deeply, be aggressive)
-
-**You are the brain. No committee. No debate. YOU decide.**
-
-For each scanned pair, evaluate:
-1. **Direction clarity**: Is the long_score OR short_score > 55? Is one clearly dominant?
-2. **News alignment**: Does the news support or contradict the technical signal?
-3. **Funding rate edge**: Negative funding = longs are paid. Positive = shorts are paid.
-4. **Category balance**: Max 2 positions per category.
-5. **Risk/reward**: Can you find SL/TP levels giving R/R >= 1.5?
-6. **Existing positions**: Don't double up. Don't fight your own positions.
-
-### Decision framework:
-- **STRONG signal** (score > 65, news aligned, funding supportive) → TRADE with confidence
-- **Moderate signal** (score 55-65, mixed news) → TRADE with smaller size
-- **Weak signal** (score < 55) → SKIP unless you see something the indicators miss
-- **Contradictory** (high long AND high short) → Market is confused, smaller size or skip
-
-### Think outside the box:
-- A coin with terrible technicals but MASSIVE positive news → override technicals, go LONG
-- A coin pumping hard but funding >0.1% → the crowd is wrong, SHORT setup brewing
-- Multiple coins in same category all signaling same direction → sector rotation, pick the best
-- News says "crash incoming" but F&G already at 10 → capitulation long opportunity
-
-### Position sizing (USE THE SCAN DATA):
-The scan output includes `suggested_sl_tp` with `suggested_qty` and `notional` for each direction.
-**USE THESE NUMBERS.** They are calculated as:
-```
-risk_per_trade = equity × 0.02
-qty = risk_per_trade / sl_distance
-capped at: equity × 0.05 / price (max 5% notional)
-```
-
-**DO NOT invent arbitrary sizes.** The scan already did the math.
-If the scan says `suggested_qty: 0.003` for BTC LONG, use 0.003.
-
-Also use the scan's `suggested_sl_tp.long.sl` and `suggested_sl_tp.long.tp` as starting points.
-You can adjust based on news/context, but the indicator-based levels are your anchor.
-
-Select **1 to 3 trades**. Quality over quantity. Each trade must have:
-- Symbol, direction, entry (from scan price), SL, TP (from suggested_sl_tp), qty (from suggested_qty), leverage, R/R, reasoning
+### 1e. Deep dive (top 2 candidates only)
+For pairs with multi-TF combined score > 55:
+- `mcp__tradingview__get_indicators` on 15m (entry timing)
+- `mcp__gloria-news__get_ticker_summary` for pair-specific catalysts
 
 ---
 
-## STEP 3 — EXECUTE (place the orders)
+## STEP 2 — DECIDE
 
-For each trade decision:
+**Regime determines strategy. Score determines conviction. ATR determines size.**
+
+### Regime-Strategy Matrix:
+
+| Regime (ADX) | Strategy | What to look for |
+|-------------|----------|-----------------|
+| **trending** (>25) | Trend follow | High directional score, EMA alignment, volume confirmation |
+| **strong_trend** (>50) | Trail only | Don't enter new. Trail existing with Chandelier Exit |
+| **ranging** (<20) | Mean revert OR skip | Bollinger bounces, RSI extremes. Most cycles = 0 trades |
+| **transitioning** (20-25) | Reduce size | Half size. Wait for breakout or breakdown |
+
+### Conviction Tiers:
+
+| Tier | Criteria | Leverage | Size |
+|------|----------|----------|------|
+| **A** | Multi-TF > 60 + regime = trending + news aligned | Use `suggested_leverage` (scan output) | Full `suggested_qty` |
+| **B** | Multi-TF 50-60 OR only single TF confirms | `suggested_leverage - 2` (min 3x) | 50% of `suggested_qty` |
+| **C** | Multi-TF < 50 OR regime = ranging OR news contradicts | **NO TRADE** | — |
+
+### Squeeze plays (special):
+When `squeeze.is_squeeze = true`:
+- Don't enter yet — squeeze = SETUP, not signal
+- Wait for breakout candle (close beyond Bollinger band)
+- When breakout confirms: Tier A trade in breakout direction
+- These are the highest R/R setups (often 3:1+)
+
+### Anti-FOMO checklist (ALL must pass):
+- [ ] Symbol NOT in cooldown
+- [ ] Price NOT moved >5% in trade direction in last 4h
+- [ ] R/R >= 2.0 (use scan's `suggested_sl_tp`)
+- [ ] Not doubling up in same category
+- [ ] Less than 6 open positions
+- [ ] Multi-TF dominant direction matches your trade direction
+
+### Select 0 to 2 trades. Each needs:
+- Symbol, direction, SL (from scan), TP (from scan), qty (from scan), leverage (from scan), R/R, reasoning
+
+---
+
+## STEP 3 — EXECUTE
+
+**Use the bracket command. Always specify leverage from scan output.**
 
 ```bash
-# LONG example:
-source .venv/bin/activate && python trading/executor.py bracket BTC/USDT:USDT 0.002 76000 71000 --side buy --leverage 5
+# Standard (use scan's suggested_leverage):
+source .venv/bin/activate && python trading/executor.py bracket BTC/USDT:USDT 0.003 80000 74000 --side buy --leverage 7
 
-# SHORT example:
-source .venv/bin/activate && python trading/executor.py bracket ETH/USDT:USDT 0.05 3200 3600 --side sell --leverage 5
-
-# With limit entry:
-source .venv/bin/activate && python trading/executor.py bracket SOL/USDT:USDT 1.5 190 165 --limit 175 --side buy --leverage 5
+# Lower conviction (suggested_leverage - 2):
+source .venv/bin/activate && python trading/executor.py bracket ETH/USDT:USDT 0.1 2400 2100 --side buy --leverage 5
 ```
 
-After each order, verify:
+**After EACH order:**
 ```bash
 source .venv/bin/activate && python trading/executor.py status
 ```
+If `unprotected` not empty → `python trading/executor.py protect`
 
 ---
 
-## STEP 4 — SAVE CONTEXT (for Discord notification)
-
-**DO NOT send a Discord message yourself.** The entrypoint handles it after the session ends.
-Instead, write your trading context to a JSON file so the Discord embed includes your reasoning:
+## STEP 4 — SAVE CONTEXT
 
 ```bash
 cat > trade_context.json << 'CONTEXT'
@@ -155,39 +178,37 @@ cat > trade_context.json << 'CONTEXT'
   "fng": "XX (regime)",
   "trades_placed": "X LONG, X SHORT",
   "new_trades": [
-    "SYMBOL DIRECTION qty @ price\nSL $X (-X%) | TP $X (+X%)\nR/R X.XX | Xx leverage\nReasoning for this trade"
+    "SYMBOL DIRECTION qty @ price\nSL $X (-X%) | TP $X (+X%)\nR/R X.XX | Xx leverage\nRegime: trending | Multi-TF: 62/38\nReasoning"
   ],
-  "reasoning": "One paragraph: why you traded or didn't trade. Reference regime, technicals, news.",
+  "reasoning": "Regime + multi-TF alignment + news + why you traded or didn't.",
   "drawdown_pct": -0.0
 }
 CONTEXT
 ```
 
-If 0 trades, still write the file with `"trades_placed": "0"` and explain why in reasoning.
-
 ---
 
-## LIMITS (code-enforced, cannot be overridden)
+## HARD LIMITS (code-enforced)
 
-| Limit | Value | Enforced by |
-|-------|-------|-------------|
-| Max leverage | 20x (default 10x) | executor.py bracket |
-| Max positions | 8 concurrent | executor.py bracket |
-| Max exposure | 75% gross | executor.py bracket |
-| Max per category | 3 | categories.py |
-| Min R/R | 1.2 (default) | executor.py bracket |
-| Drawdown kill | -20% | risk_guardian.py hook |
-| Emergency SL | -10% from entry | executor.py protect |
-| Emergency TP | +15% from entry | executor.py protect |
-| Trail breakeven | at +5% PnL | executor.py protect --trail |
-| Trail distance | 5% from price | executor.py protect --trail |
+| Limit | Value |
+|-------|-------|
+| Max leverage | **20x** (use scan's `suggested_leverage`) |
+| Max positions | **8** concurrent |
+| Max exposure | **75%** gross |
+| Max per category | **3** |
+| Min R/R | **1.5** (code) / **2.0** (target) |
+| Cooldown | **60 min** per symbol |
+| Drawdown kill | **-20%** |
+| Risk per trade | **2%** equity (Half-Kelly) |
+| SL distance | **2× ATR** (adaptive) |
+| TP distance | **4× ATR** (adaptive, 2.0 R/R) |
+| Trail method | **Chandelier Exit** (3× ATR from high) |
+| Max hold | **7 days** |
 
-## RULES
+## KEY INSIGHT
 
-1. **ALWAYS** check protection before new trades
-2. **ALWAYS** SL + TP on every order
-3. If executor command fails → log it, move on, do NOT retry blindly
-4. **0 trades is acceptable** but should be rare — always explain why
-5. In doubt → trade smaller, NOT skip
-6. **Be aggressive** — take meaningful positions that generate real P&L data
-7. **Learn from losses** — every loss is tuition if you analyze why
+The old system chased signals with fixed leverage and fixed stops.
+The new system adapts EVERYTHING to volatility:
+- **High ATR (volatile)**: wide SL, wide TP, low leverage, same risk
+- **Low ATR (calm)**: tight SL, tight TP, high leverage, same risk
+- **Result**: consistent 2% risk per trade regardless of market conditions

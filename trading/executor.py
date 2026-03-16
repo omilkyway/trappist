@@ -36,7 +36,7 @@ from trading.client import (
     cancel_order,
 )
 from trading.categories import check_category_limit, get_category
-from trading.indicators import compute_signals
+from trading.indicators import compute_signals, compute_multi_timeframe, chandelier_exit
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +72,19 @@ def cmd_status(args):
         except Exception:
             pass
 
-    # Drawdown calculation
+    # Auto-init balance on first run
     initial = state.get("initial_balance", 0)
     equity = account["equity"]
+    if initial == 0 and equity > 0:
+        state["initial_balance"] = equity
+        initial = equity
+        try:
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass
+
+    # Drawdown calculation
     drawdown_pct = round((equity - initial) / initial * 100, 2) if initial > 0 else 0
 
     # Trade stats from history
@@ -109,9 +119,26 @@ def cmd_status(args):
         "avg_win_pct": avg_win,
         "avg_loss_pct": avg_loss,
         "recent_symbols": list({t.get("symbol", "") for t in recent_entries}),
+        "cooldowns": _get_active_cooldowns(state),
     }
     print(json.dumps(output, indent=2))
     return 0
+
+
+def _get_active_cooldowns(state: dict) -> dict:
+    """Return symbols still in cooldown with minutes remaining."""
+    cooldowns = state.get("cooldowns", {})
+    now = datetime.now(timezone.utc)
+    active = {}
+    for base, ts in cooldowns.items():
+        try:
+            last_dt = datetime.fromisoformat(ts)
+            minutes_since = (now - last_dt).total_seconds() / 60
+            if minutes_since < 60:
+                active[base] = round(60 - minutes_since)
+        except Exception:
+            pass
+    return active
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +203,17 @@ def cmd_scan(args):
             signals["change_24h"] = ticker_data.get("change_pct", 0)
             signals["volume_24h"] = ticker_data.get("volume_24h", 0)
 
-            # Position sizing hint (2% risk / SL distance)
+            # Position sizing — Half-Kelly: 2% risk per trade
             sl_tp = signals.get("suggested_sl_tp", {})
             price = signals["price"]
             if equity > 0 and price > 0 and sl_tp:
-                risk_amount = equity * 0.05  # 5% risk per trade (aggressive)
+                risk_amount = equity * 0.02  # 2% risk per trade (Half-Kelly)
                 for direction in ("long", "short"):
                     levels = sl_tp.get(direction, {})
                     sl_dist = abs(price - levels.get("sl", price))
                     if sl_dist > 0:
                         suggested_qty = round(risk_amount / sl_dist, 6)
-                        max_qty = round(equity * 0.15 / price, 6)  # 15% max notional
+                        max_qty = round(equity * 0.12 / price, 6)  # 12% max notional
                         levels["suggested_qty"] = min(suggested_qty, max_qty)
                         levels["notional"] = round(levels["suggested_qty"] * price, 2)
 
@@ -195,6 +222,28 @@ def cmd_scan(args):
             ss = signals["signals"]["short_score"]
             signals["best_score"] = max(ls, ss)
             signals["best_direction"] = "LONG" if ls > ss else "SHORT"
+
+            # Multi-timeframe confirmation for promising pairs
+            if max(ls, ss) > 50:
+                try:
+                    timeframes = {args.timeframe: df}
+                    if args.timeframe != "1h":
+                        df_1h = get_bars(sym, timeframe="1h", limit=200)
+                        if len(df_1h) >= 50:
+                            timeframes["1h"] = df_1h
+                    if args.timeframe != "1d":
+                        df_1d = get_bars(sym, timeframe="1d", limit=200)
+                        if len(df_1d) >= 50:
+                            timeframes["1d"] = df_1d
+
+                    if len(timeframes) > 1:
+                        mtf = compute_multi_timeframe(timeframes, funding_rate=funding_pct)
+                        signals["multi_tf"] = mtf
+                        # Override ranking with multi-TF combined score
+                        signals["best_score"] = max(mtf["combined_long_score"], mtf["combined_short_score"])
+                        signals["best_direction"] = "LONG" if mtf["combined_long_score"] > mtf["combined_short_score"] else "SHORT"
+                except Exception:
+                    pass  # Fall back to single TF score
 
             results[sym] = signals
         except Exception as e:
@@ -231,6 +280,30 @@ def cmd_bracket(args):
     if args.leverage > 20:
         print(json.dumps({"success": False, "error": f"Leverage {args.leverage}x > max 20x"}, indent=2))
         return 1
+
+    # Cooldown check — prevent over-trading same symbol
+    state_path = Path("state.json")
+    try:
+        _state = json.load(open(state_path)) if state_path.exists() else {}
+    except Exception:
+        _state = {}
+    cooldowns = _state.get("cooldowns", {})
+    base = symbol.split("/")[0]
+    last_ts = cooldowns.get(base)
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts)
+            minutes_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+            cooldown_minutes = 60
+            if minutes_since < cooldown_minutes:
+                remaining = round(cooldown_minutes - minutes_since)
+                print(json.dumps({
+                    "success": False,
+                    "error": f"COOLDOWN: {base} was traded {int(minutes_since)}m ago. Wait {remaining}m more.",
+                }, indent=2))
+                return 1
+        except Exception:
+            pass
 
     # Hard limits: positions count + exposure
     try:
@@ -347,6 +420,10 @@ def _log_trade(result, symbol: str, side: str, args):
     state["trades"] = state["trades"][-200:]
     state["killed"] = state.get("killed", False)
 
+    # Update cooldown for this symbol
+    base = symbol.split("/")[0]
+    state.setdefault("cooldowns", {})[base] = datetime.now(timezone.utc).isoformat()
+
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -406,6 +483,11 @@ def _log_close(pnl_data: dict):
     })
     state["closed_trades"] = state["closed_trades"][-200:]
 
+    # Update cooldown for this symbol
+    base = pnl_data.get("symbol", "").split("/")[0]
+    if base:
+        state.setdefault("cooldowns", {})[base] = datetime.now(timezone.utc).isoformat()
+
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -445,17 +527,24 @@ def cmd_protect(args):
             for o in orders
         )
 
-        # Fix missing protection (emergency 10% SL, 15% TP — wide to let trades breathe)
+        # Fix missing protection — leverage-aware SL/TP
+        # At 10x, -10% = -100% margin = liquidation. Cap margin loss at 50%.
+        leverage = pos.get("leverage", 1) or 1
+        max_loss_pct = min(0.10, 0.50 / max(leverage, 1))
+        tp_gain_pct = min(0.15, 0.80 / max(leverage, 1))
+
         if not has_sl:
-            sl_price = round(entry * (0.90 if side == "long" else 1.10), 2)
+            sl_price = round(entry * (1 - max_loss_pct) if side == "long" else entry * (1 + max_loss_pct), 2)
             result = place_stop_order(sym, contracts, sl_price, side=close_side)
             actions.append({"symbol": sym, "action": "EMERGENCY_SL", "price": sl_price,
+                           "leverage": leverage, "loss_pct": round(max_loss_pct * 100, 1),
                            "success": result.success, "error": result.error})
 
         if not has_tp:
-            tp_price = round(entry * (1.15 if side == "long" else 0.85), 2)
+            tp_price = round(entry * (1 + tp_gain_pct) if side == "long" else entry * (1 - tp_gain_pct), 2)
             result = place_tp_order(sym, contracts, tp_price, side=close_side)
             actions.append({"symbol": sym, "action": "EMERGENCY_TP", "price": tp_price,
+                           "leverage": leverage, "gain_pct": round(tp_gain_pct * 100, 1),
                            "success": result.success, "error": result.error})
 
         # Time stop check
@@ -470,7 +559,7 @@ def cmd_protect(args):
             except Exception:
                 pass
 
-        # Trail stops (only if --trail flag)
+        # Trail stops — Chandelier Exit (ATR-based, volatility-adaptive)
         if args.trail and has_sl:
             sl_order = next(
                 (o for o in orders
@@ -482,27 +571,37 @@ def cmd_protect(args):
                 current_sl = sl_order["stop_price"]
                 new_sl = None
 
-                if side == "long" and pnl_pct >= 8.0:
-                    new_sl = round(current * 0.95, 2)  # Trail at 5%
-                    if new_sl <= current_sl:
-                        new_sl = None
-                elif side == "long" and pnl_pct >= 5.0:
-                    new_sl = entry  # Breakeven
-                    if new_sl <= current_sl:
-                        new_sl = None
-                elif side == "short" and pnl_pct >= 8.0:
-                    new_sl = round(current * 1.05, 2)
-                    if new_sl >= current_sl:
-                        new_sl = None
-                elif side == "short" and pnl_pct >= 5.0:
-                    new_sl = entry
-                    if new_sl >= current_sl:
-                        new_sl = None
+                if pnl_pct >= 3.0:
+                    # Try Chandelier Exit (ATR-based trail)
+                    try:
+                        df = get_bars(sym, timeframe="4h", limit=100)
+                        if len(df) >= 50:
+                            ce = chandelier_exit(df["high"], df["low"], df["close"],
+                                                 lookback=22, multiplier=3.0)
+                            ce_last = ce.iloc[-1]
+                            if side == "long":
+                                chandelier_sl = round(float(ce_last["long_exit"]), 2)
+                                if chandelier_sl > current_sl and chandelier_sl < current:
+                                    new_sl = chandelier_sl
+                            else:
+                                chandelier_sl = round(float(ce_last["short_exit"]), 2)
+                                if chandelier_sl < current_sl and chandelier_sl > current:
+                                    new_sl = chandelier_sl
+                    except Exception:
+                        pass
+
+                    # Fallback: breakeven at +3% if Chandelier didn't trigger
+                    if new_sl is None and pnl_pct >= 3.0:
+                        be_sl = entry
+                        if side == "long" and be_sl > current_sl:
+                            new_sl = be_sl
+                        elif side == "short" and be_sl < current_sl:
+                            new_sl = be_sl
 
                 if new_sl and not args.dry_run:
                     cancel_order(sl_order["id"], sym)
                     result = place_stop_order(sym, contracts, new_sl, side=close_side)
-                    actions.append({"symbol": sym, "action": "TRAIL_SL",
+                    actions.append({"symbol": sym, "action": "CHANDELIER_TRAIL",
                                    "old_sl": current_sl, "new_sl": new_sl,
                                    "pnl_pct": pnl_pct, "success": result.success})
                 elif new_sl:
@@ -553,7 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--side", default="buy", choices=["buy", "sell"], help="buy=LONG, sell=SHORT")
     b.add_argument("--limit", type=float, default=None, help="Limit entry price (None=market)")
     b.add_argument("--leverage", type=int, default=10, help="Leverage (default: 10, max 20)")
-    b.add_argument("--min-rr", type=float, default=1.2, help="Min R/R ratio (default: 1.2)")
+    b.add_argument("--min-rr", type=float, default=1.5, help="Min R/R ratio (default: 1.5, aim for 2.0+)")
     b.add_argument("--no-validate", action="store_true", help="Skip R/R validation")
 
     c = sub.add_parser("close", help="Close position + cancel orders")

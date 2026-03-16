@@ -22,5 +22,30 @@
       "Bash(rm -rf*)",
       "Bash(sudo*)"
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": ".claude/statusline.sh",
+    "padding": 1
+  },
+  "spinnerVerbs": {
+    "mode": "replace",
+    "verbs": [
+      "Scanning the markets",
+      "Reading the charts",
+      "Checking funding rates",
+      "Calculating risk/reward",
+      "Sizing the position",
+      "Analyzing momentum",
+      "Hunting for setups",
+      "Watching the order book",
+      "Evaluating the regime",
+      "Processing market intel",
+      "Trailing the stops",
+      "Checking drawdown limits",
+      "Reviewing past trades",
+      "Optimizing entries",
+      "Running the numbers"
+    ]
   }
 }
