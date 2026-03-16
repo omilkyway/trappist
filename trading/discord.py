@@ -60,11 +60,24 @@ def _safe(func, default=None):
 # Embed builders
 # ---------------------------------------------------------------------------
 
+def _load_trade_context() -> dict:
+    """Load trade context written by Claude during STEP 4."""
+    for path in ["trade_context.json", "/app/trade_context.json"]:
+        try:
+            with open(path) as f:
+                import json
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return {}
+
+
 def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0) -> dict:
-    """Build embed for trading cycle run."""
+    """Build single merged embed for trading cycle run."""
     acct = _safe(get_account, {})
     positions = _safe(get_positions, [])
     orders = _safe(get_open_orders, [])
+    ctx = _load_trade_context()
     mode = "TESTNET" if is_sandbox() else "LIVE"
 
     color = COLOR_GREEN if exit_code == 0 else COLOR_RED
@@ -72,12 +85,31 @@ def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0) -> dict:
     unrealized_pnl = acct.get("unrealized_pnl", 0)
     exposure_pct = acct.get("exposure_pct", 0)
 
+    # Row 1: mode, F&G, equity, exposure
     fields = [
         {"name": "Mode", "value": f"`{mode}`", "inline": True},
+    ]
+    if ctx.get("fng"):
+        fields.append({"name": "F&G", "value": f"`{ctx['fng']}`", "inline": True})
+    fields += [
         {"name": "Equity", "value": f"`{equity:,.2f} USDT`", "inline": True},
         {"name": "Exposure", "value": f"`{exposure_pct:.1f}%`", "inline": True},
     ]
 
+    # Row 2: trades placed, drawdown
+    if ctx.get("trades_placed"):
+        fields.append({"name": "Trades Placed", "value": f"`{ctx['trades_placed']}`", "inline": True})
+    if ctx.get("drawdown_pct") is not None:
+        dd = ctx["drawdown_pct"]
+        fields.append({"name": "Drawdown", "value": f"`{dd:+.2f}%`", "inline": True})
+
+    # New trades detail
+    if ctx.get("new_trades"):
+        for i, trade in enumerate(ctx["new_trades"][:4]):
+            label = "New Trade" if len(ctx["new_trades"]) == 1 else f"New Trade {i+1}"
+            fields.append({"name": label, "value": trade, "inline": False})
+
+    # Open positions
     if positions:
         pos_lines = []
         for p in positions[:8]:
@@ -102,6 +134,11 @@ def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0) -> dict:
     if orders:
         fields.append({"name": "Open Orders", "value": f"`{len(orders)}`", "inline": True})
 
+    # Reasoning
+    if ctx.get("reasoning"):
+        fields.append({"name": "Reasoning", "value": ctx["reasoning"][:1024], "inline": False})
+
+    # Session meta
     if cost > 0:
         fields.append({"name": "Session Cost", "value": f"`${cost:.2f}`", "inline": True})
     if turns > 0:

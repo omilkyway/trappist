@@ -144,16 +144,26 @@ source .venv/bin/activate && python trading/executor.py status
 
 ---
 
-## STEP 4 — NOTIFY (Discord via discord.py)
+## STEP 4 — SAVE CONTEXT (for Discord notification)
 
-Send a Discord notification using the trading module (rich embed with live positions & PnL):
+**DO NOT send a Discord message yourself.** The entrypoint handles it after the session ends.
+Instead, write your trading context to a JSON file so the Discord embed includes your reasoning:
 
 ```bash
-source .venv/bin/activate && python trading/discord.py --run-type cycle --exit-code 0
+cat > trade_context.json << 'CONTEXT'
+{
+  "fng": "XX (regime)",
+  "trades_placed": "X LONG, X SHORT",
+  "new_trades": [
+    "SYMBOL DIRECTION qty @ price\nSL $X (-X%) | TP $X (+X%)\nR/R X.XX | Xx leverage\nReasoning for this trade"
+  ],
+  "reasoning": "One paragraph: why you traded or didn't trade. Reference regime, technicals, news.",
+  "drawdown_pct": -0.0
+}
+CONTEXT
 ```
 
-If the cycle had errors, use `--exit-code 1` instead.
-The embed is built automatically from live account data (positions, equity, exposure, PnL).
+If 0 trades, still write the file with `"trades_placed": "0"` and explain why in reasoning.
 
 ---
 
