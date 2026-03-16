@@ -144,32 +144,16 @@ source .venv/bin/activate && python trading/executor.py status
 
 ---
 
-## STEP 4 — NOTIFY (Discord embed)
+## STEP 4 — NOTIFY (Discord via discord.py)
 
-Send a Discord notification with full context. Use curl:
+Send a Discord notification using the trading module (rich embed with live positions & PnL):
 
 ```bash
-source .env.local 2>/dev/null || source .env 2>/dev/null
-curl -s -H "Content-Type: application/json" -X POST "$DISCORD_WEBHOOK_URL" \
-  -d '{
-    "embeds": [{
-      "title": "🪐 TRAPPIST Trading Cycle",
-      "color": 3447003,
-      "fields": [
-        {"name": "Mode", "value": "TESTNET/LIVE", "inline": true},
-        {"name": "F&G", "value": "XX (regime)", "inline": true},
-        {"name": "Equity", "value": "$X,XXX", "inline": true},
-        {"name": "Trades Placed", "value": "X LONG, X SHORT", "inline": true},
-        {"name": "Exposure", "value": "XX%", "inline": true},
-        {"name": "Details", "value": "BTC LONG 0.002 @ 72700 SL 71000 TP 76000\nETH SHORT 0.05 @ 3500 SL 3600 TP 3200"}
-      ],
-      "footer": {"text": "trappist v2.0"},
-      "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
-    }]
-  }'
+source .venv/bin/activate && python trading/discord.py --run-type cycle --exit-code 0
 ```
 
-If 0 trades: still notify with "No signal" and explain why.
+If the cycle had errors, use `--exit-code 1` instead.
+The embed is built automatically from live account data (positions, equity, exposure, PnL).
 
 ---
 
