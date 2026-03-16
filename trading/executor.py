@@ -77,9 +77,18 @@ def cmd_status(args):
     equity = account["equity"]
     drawdown_pct = round((equity - initial) / initial * 100, 2) if initial > 0 else 0
 
-    # Recent trade stats (last 20)
+    # Trade stats from history
     trades = state.get("trades", [])
-    recent = trades[-20:] if trades else []
+    closed = state.get("closed_trades", [])
+    recent_entries = trades[-20:] if trades else []
+
+    # Win/loss from closed trades
+    wins = [t for t in closed if t.get("pnl_pct", 0) > 0]
+    losses = [t for t in closed if t.get("pnl_pct", 0) < 0]
+    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0
+    total_realized_pnl = round(sum(t.get("unrealized_pnl", 0) for t in closed), 2)
+    avg_win = round(sum(t.get("pnl_pct", 0) for t in wins) / len(wins), 2) if wins else 0
+    avg_loss = round(sum(t.get("pnl_pct", 0) for t in losses) / len(losses), 2) if losses else 0
 
     output = {
         "mode": "TESTNET" if is_sandbox() else "LIVE",
@@ -93,9 +102,13 @@ def cmd_status(args):
         "unprotected": unprotected,
         "killed": state.get("killed", False),
         "initial_balance": initial,
-        "total_trades": len(trades),
-        "recent_trades": len(recent),
-        "recent_symbols": list({t.get("symbol", "") for t in recent}),
+        "total_entries": len(trades),
+        "total_closed": len(closed),
+        "win_rate": win_rate,
+        "total_realized_pnl": total_realized_pnl,
+        "avg_win_pct": avg_win,
+        "avg_loss_pct": avg_loss,
+        "recent_symbols": list({t.get("symbol", "") for t in recent_entries}),
     }
     print(json.dumps(output, indent=2))
     return 0
@@ -106,45 +119,95 @@ def cmd_status(args):
 # ---------------------------------------------------------------------------
 
 def cmd_scan(args):
-    """Dual technical analysis + funding rate on all active pairs."""
+    """Dual technical analysis + funding rate on all active pairs.
+
+    Two-pass approach:
+    1. Quick pre-filter: fetch ticker for all pairs, keep only movers (>1% change or high volume)
+    2. Deep analysis: full TA + funding only on filtered pairs
+
+    Returns top candidates sorted by best score, with position sizing hints.
+    """
     if args.pairs:
         pairs = [format_symbol(p.strip()) for p in args.pairs.split(",")]
     else:
         pairs = get_active_pairs()
 
-    results = {}
+    # Pass 1: Quick pre-filter — only analyze pairs worth looking at
+    candidates = []
     for sym in pairs:
+        try:
+            t = get_ticker(sym)
+            change = abs(t.get("change_pct", 0))
+            vol = t.get("volume_24h", 0)
+            # Keep: movers (>1.5% change), high volume (>$50M), or top 3 always
+            if change > 1.5 or vol > 50_000_000 or sym in pairs[:3]:
+                candidates.append((sym, t))
+        except Exception:
+            if sym in pairs[:3]:  # Always include BTC, ETH, SOL
+                candidates.append((sym, {}))
+
+    # Pass 2: Deep analysis on filtered candidates
+    # Also read account for position sizing
+    try:
+        account = get_account()
+        equity = account["equity"]
+    except Exception:
+        equity = 0
+
+    results = {}
+    for sym, ticker_data in candidates:
         try:
             df = get_bars(sym, timeframe=args.timeframe, limit=500)
             if len(df) < 50:
                 results[sym] = {"error": f"Only {len(df)} bars (need 50+)"}
                 continue
 
-            # Funding rate
             fr = get_funding_rate(sym)
             funding_pct = fr.get("funding_rate_pct", 0)
 
-            # Technical signals with funding integrated
             signals = compute_signals(df, funding_rate=funding_pct)
             signals["funding_rate_pct"] = funding_pct
             signals["category"] = get_category(sym)
 
-            # Current price from ticker for fresh data
-            try:
-                t = get_ticker(sym)
-                signals["bid"] = t["bid"]
-                signals["ask"] = t["ask"]
-                signals["price"] = t["last"]
-                signals["change_24h"] = t["change_pct"]
-                signals["volume_24h"] = t["volume_24h"]
-            except Exception:
-                pass
+            # Inject ticker data
+            signals["bid"] = ticker_data.get("bid", 0)
+            signals["ask"] = ticker_data.get("ask", 0)
+            signals["price"] = ticker_data.get("last", signals.get("price", 0))
+            signals["change_24h"] = ticker_data.get("change_pct", 0)
+            signals["volume_24h"] = ticker_data.get("volume_24h", 0)
+
+            # Position sizing hint (2% risk / SL distance)
+            sl_tp = signals.get("suggested_sl_tp", {})
+            price = signals["price"]
+            if equity > 0 and price > 0 and sl_tp:
+                risk_amount = equity * 0.02
+                for direction in ("long", "short"):
+                    levels = sl_tp.get(direction, {})
+                    sl_dist = abs(price - levels.get("sl", price))
+                    if sl_dist > 0:
+                        suggested_qty = round(risk_amount / sl_dist, 6)
+                        max_qty = round(equity * 0.05 / price, 6)
+                        levels["suggested_qty"] = min(suggested_qty, max_qty)
+                        levels["notional"] = round(levels["suggested_qty"] * price, 2)
+
+            # Best direction score for ranking
+            ls = signals["signals"]["long_score"]
+            ss = signals["signals"]["short_score"]
+            signals["best_score"] = max(ls, ss)
+            signals["best_direction"] = "LONG" if ls > ss else "SHORT"
 
             results[sym] = signals
         except Exception as e:
             results[sym] = {"error": str(e)}
 
-    print(json.dumps(results, indent=2))
+    # Sort by best score descending
+    sorted_results = dict(
+        sorted(results.items(),
+               key=lambda x: x[1].get("best_score", 0) if "error" not in x[1] else 0,
+               reverse=True)
+    )
+
+    print(json.dumps(sorted_results, indent=2))
     return 0
 
 
@@ -268,6 +331,23 @@ def cmd_close(args):
     """Close a position and cancel all related orders."""
     symbol = format_symbol(args.symbol)
 
+    # Capture position before closing for P&L logging
+    pre_close_pnl = None
+    try:
+        positions = get_positions()
+        pos = next((p for p in positions if p["symbol"] == symbol), None)
+        if pos:
+            pre_close_pnl = {
+                "symbol": symbol,
+                "side": pos["side"],
+                "entry_price": pos["entry_price"],
+                "close_price": pos["mark_price"],
+                "pnl_pct": pos["pnl_pct"],
+                "unrealized_pnl": pos["unrealized_pnl"],
+            }
+    except Exception:
+        pass
+
     # Cancel all orders for this symbol first
     try:
         cancel_all_orders(symbol)
@@ -275,8 +355,31 @@ def cmd_close(args):
         pass
 
     result = close_position(symbol)
+
+    # Log the close with realized P&L
+    if result.success and pre_close_pnl:
+        _log_close(pre_close_pnl)
+
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.success else 1
+
+
+def _log_close(pnl_data: dict):
+    """Log position close with P&L to state.json for learning."""
+    state_path = Path("state.json")
+    try:
+        state = json.load(open(state_path)) if state_path.exists() else {}
+    except Exception:
+        state = {}
+
+    state.setdefault("closed_trades", []).append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **pnl_data,
+    })
+    state["closed_trades"] = state["closed_trades"][-200:]
+
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 # ---------------------------------------------------------------------------

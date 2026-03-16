@@ -31,13 +31,18 @@ source .venv/bin/activate && python trading/executor.py protect --trail --max-da
 Fix any unprotected positions BEFORE looking for new trades. Trail profitable ones.
 TIME_STOP_WARNING = close that position before opening new ones.
 
-### 1c. Learn from past trades
-Read state.json `trades` array. Ask yourself:
-- Am I repeatedly losing on the same symbols? → Avoid them.
-- Am I always going LONG? → Force yourself to find SHORT setups.
-- Are my SL getting hit too often? → Widen stops or improve entry timing.
-- Are my TP never reached? → Set more realistic targets.
-This 30-second reflection makes you a better trader every cycle.
+### 1c. Learn from past performance
+Read the status output carefully:
+- `win_rate` — Below 40%? Your entries are bad. Be more selective.
+- `avg_win_pct` vs `avg_loss_pct` — Wins must be bigger than losses (R/R > 1).
+- `total_realized_pnl` — Negative? Something is systematically wrong.
+- `recent_symbols` — Don't re-enter symbols you just traded (avoid revenge trading).
+- `drawdown_pct` — Getting worse? Reduce size, not frequency.
+
+**Quick rules based on history:**
+- Win rate < 30% after 10+ trades → STOP trading, something is broken
+- avg_loss > 2× avg_win → SL too wide or TP too tight
+- Same symbol losing 3× in a row → BLACKLIST it for 24h
 
 ### 1d. Market regime — Fear & Greed Index
 Use MCP tool `mcp__fear-greed__get_current_fng_tool` to get current F&G.
@@ -97,16 +102,23 @@ For each scanned pair, evaluate:
 - Multiple coins in same category all signaling same direction → sector rotation, pick the best
 - News says "crash incoming" but F&G already at 10 → capitulation long opportunity
 
-### Position sizing:
+### Position sizing (USE THE SCAN DATA):
+The scan output includes `suggested_sl_tp` with `suggested_qty` and `notional` for each direction.
+**USE THESE NUMBERS.** They are calculated as:
 ```
-risk_per_trade = equity × 0.02  (2% risk)
-sl_distance = abs(entry - stop_loss)
-position_size = risk_per_trade / sl_distance
-max_notional = equity × 0.05  (5% max per trade)
+risk_per_trade = equity × 0.02
+qty = risk_per_trade / sl_distance
+capped at: equity × 0.05 / price (max 5% notional)
 ```
 
+**DO NOT invent arbitrary sizes.** The scan already did the math.
+If the scan says `suggested_qty: 0.003` for BTC LONG, use 0.003.
+
+Also use the scan's `suggested_sl_tp.long.sl` and `suggested_sl_tp.long.tp` as starting points.
+You can adjust based on news/context, but the indicator-based levels are your anchor.
+
 Select **1 to 3 trades**. Quality over quantity. Each trade must have:
-- Symbol, direction (LONG/SHORT), entry, SL, TP, size, leverage, R/R, reasoning
+- Symbol, direction, entry (from scan price), SL, TP (from suggested_sl_tp), qty (from suggested_qty), leverage, R/R, reasoning
 
 ---
 
