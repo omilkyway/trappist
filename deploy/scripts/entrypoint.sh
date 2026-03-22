@@ -9,40 +9,52 @@ S3_ENABLED="${SCW_S3_ACCESS_KEY:-}"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 # ==================================================================
-# 0. AUTH — OAuth primary, API key automatic fallback
+# 0. AUTH — Setup token > OAuth credentials > API key (with fallback)
 # ==================================================================
-# Strategy: Try OAuth first. If it fails at any point, fall back to
-# ANTHROPIC_API_KEY transparently and alert on Discord with auth link.
+# Priority:
+#   1. CLAUDE_CODE_OAUTH_TOKEN (setup-token, 1 year, no refresh needed)
+#   2. CLAUDE_CREDENTIALS_B64 (legacy OAuth, 8h tokens, needs refresh)
+#   3. ANTHROPIC_API_KEY (pay-per-use, no expiry)
 CLAUDE_DIR="$HOME/.claude"
 CREDENTIALS_FILE="$CLAUDE_DIR/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
 BACKUP_FILE="/tmp/credentials_backup.json"
-AUTH_MODE="api_key"  # default — always safe
+AUTH_MODE="none"
 
-# Helper: send Discord auth alert with re-login link
-send_auth_alert() {
-    local REASON="${1:-OAuth token needs refresh}"
+# Helper: send Discord alert (auth or billing)
+send_discord_alert() {
+    local TITLE="${1:-Auth Alert}"
+    local DESC="${2:-Unknown error}"
+    local COLOR="${3:-16750848}"  # orange default
     if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
         curl -sf -H "Content-Type: application/json" \
-            -d "{\"embeds\":[{\"title\":\"OAuth Auth — Fallback API Key\",\"description\":\"**Raison:** ${REASON}\\n\\nLe job continue avec la cl\u00e9 API. Pour r\u00e9activer OAuth :\\n\\n**1.** Sur ta machine :\\n\\\`\\\`\\\`\\nclaude auth login\\n\\\`\\\`\\\`\\n**2.** Puis push les creds :\\n\\\`\\\`\\\`\\nbash deploy/scripts/reauth.sh\\n\\\`\\\`\\\`\\n\\n**Lien direct auth :** [claude.ai/settings](https://claude.ai/settings)\",\"color\":16750848,\"footer\":{\"text\":\"trappist v2.0 \u2022 job continue en API key\"}}]}" \
+            -d "{\"embeds\":[{\"title\":\"${TITLE}\",\"description\":\"${DESC}\",\"color\":${COLOR},\"footer\":{\"text\":\"trappist v3.0\"}}]}" \
             "$DISCORD_WEBHOOK_URL" || true
     fi
 }
 
-if [[ -n "${CLAUDE_CREDENTIALS_B64:-}" ]]; then
-    AUTH_MODE="oauth"
-    log "AUTH: Injecting OAuth credentials..."
+send_auth_alert() {
+    local REASON="${1:-OAuth token needs refresh}"
+    send_discord_alert \
+        "Auth Failed — Action Required" \
+        "**Raison:** ${REASON}\\n\\nPour fix :\\n\\n**1.** Sur ta machine :\\n\\\`\\\`\\\`\\nclaude setup-token\\n\\\`\\\`\\\`\\n**2.** Puis update le job Scaleway :\\n\\\`\\\`\\\`\\nbash deploy/scripts/reauth.sh\\n\\\`\\\`\\\`\\n\\n**Fallback:** Le job essaie ANTHROPIC_API_KEY si disponible." \
+        16750848
+}
 
+send_billing_alert() {
+    local AUTH="${1:-api_key}"
+    send_discord_alert \
+        "BILLING ERROR — Bot stopped" \
+        "**Credit balance is too low** (mode: ${AUTH})\\n\\nLe bot ne peut plus trader.\\n\\n**Pour fix :**\\n- Recharger les credits sur [console.anthropic.com](https://console.anthropic.com)\\n- Ou passer en setup-token (subscription Max) :\\n\\\`\\\`\\\`\\nclaude setup-token\\n\\\`\\\`\\\`" \
+        15158332
+}
+
+# Ensure onboarding is skipped
+setup_claude_json() {
     mkdir -p "$CLAUDE_DIR"
-
-    # Inject .credentials.json
-    echo "$CLAUDE_CREDENTIALS_B64" | base64 -d > "$CREDENTIALS_FILE"
-    chmod 600 "$CREDENTIALS_FILE"
-
-    # Inject .claude.json (skip onboarding)
     if [[ -n "${CLAUDE_CONFIG_B64:-}" ]]; then
         echo "$CLAUDE_CONFIG_B64" | base64 -d > "$CLAUDE_JSON"
-    else
+    elif [[ ! -f "$CLAUDE_JSON" ]]; then
         cat > "$CLAUDE_JSON" << 'MINCONFIG'
 {
   "completedOnboarding": true,
@@ -50,6 +62,22 @@ if [[ -n "${CLAUDE_CREDENTIALS_B64:-}" ]]; then
 }
 MINCONFIG
     fi
+}
+
+# --- Priority 1: Setup token (1 year, no refresh, subscription billing) ---
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    AUTH_MODE="setup_token"
+    log "AUTH: Using setup-token (1-year, subscription billing)"
+    setup_claude_json
+
+# --- Priority 2: Legacy OAuth credentials (8h tokens, refresh needed) ---
+elif [[ -n "${CLAUDE_CREDENTIALS_B64:-}" ]]; then
+    AUTH_MODE="oauth"
+    log "AUTH: Injecting OAuth credentials..."
+    setup_claude_json
+
+    echo "$CLAUDE_CREDENTIALS_B64" | base64 -d > "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE"
 
     # Backup credentials before execution (issue #29896 — wipe protection)
     cp "$CREDENTIALS_FILE" "$BACKUP_FILE"
@@ -57,7 +85,7 @@ MINCONFIG
     # Validate: check refreshToken exists
     REFRESH_TOKEN=$(jq -r '.claudeAiOauth.refreshToken // ""' "$CREDENTIALS_FILE" 2>/dev/null || echo "")
     if [[ -z "$REFRESH_TOKEN" ]]; then
-        log "AUTH: No refreshToken — OAuth won't work, falling back to API key"
+        log "AUTH: No refreshToken — falling back"
         AUTH_MODE="api_key"
         send_auth_alert "refreshToken manquant dans les credentials"
     else
@@ -70,16 +98,18 @@ MINCONFIG
         fi
     fi
 
+# --- Priority 3: API key (pay-per-use) ---
 elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     AUTH_MODE="api_key"
-    log "AUTH: Using API key (no OAuth credentials configured)"
+    log "AUTH: Using API key (pay-per-use billing)"
+
+# --- No auth at all ---
 else
-    log "AUTH: FATAL — No auth at all"
-    if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
-        curl -sf -H "Content-Type: application/json" \
-            -d '{"embeds":[{"title":"FATAL — No auth configured","description":"Neither OAuth nor API key found. Job aborted.","color":15158332}]}' \
-            "$DISCORD_WEBHOOK_URL" || true
-    fi
+    log "AUTH: FATAL — No auth configured"
+    send_discord_alert \
+        "FATAL — No auth configured" \
+        "Neither setup-token, OAuth, nor API key found. Job aborted." \
+        15158332
     exit 1
 fi
 
@@ -187,9 +217,13 @@ run_claude() {
 }
 
 is_auth_error() {
-    # Check if a log file contains auth failure patterns
     local LOG_FILE="$1"
     [[ -f "$LOG_FILE" ]] && grep -qi "authentication_error\|401\|OAuth token has expired\|login required\|unauthorized\|token expired\|EAUTH\|invalid_grant\|refresh_token" "$LOG_FILE" 2>/dev/null
+}
+
+is_billing_error() {
+    local LOG_FILE="$1"
+    [[ -f "$LOG_FILE" ]] && grep -qi "billing_error\|Credit balance is too low\|insufficient_credits\|quota_exceeded\|rate_limit_error" "$LOG_FILE" 2>/dev/null
 }
 
 if [[ "$RUN_TYPE" == "protect" ]]; then
@@ -211,68 +245,77 @@ else
     run_claude "$PROMPT" "$MAX_TURNS" "$LOG_FILE"
     EXIT_CODE=$?
 
-    # ── OAuth fail? Automatic fallback to API key ──
-    if [[ $EXIT_CODE -ne 0 ]] && [[ "$AUTH_MODE" == "oauth" ]] && [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-        if is_auth_error "$LOG_FILE"; then
-            log "AUTH: OAuth failed — switching to API key and retrying..."
-            AUTH_MODE="api_key_fallback"
+    # ── Billing error? Alert immediately, no retry ──
+    if [[ $EXIT_CODE -ne 0 ]] && is_billing_error "$LOG_FILE"; then
+        log "BILLING: Credit balance too low (auth=$AUTH_MODE)"
+        send_billing_alert "$AUTH_MODE"
+        # Don't retry — billing won't fix itself
 
-            # Restore credential backup (issue #29896)
-            if [[ -f "$BACKUP_FILE" ]]; then
-                cp "$BACKUP_FILE" "$CREDENTIALS_FILE" 2>/dev/null || true
-            fi
+    # ── Auth error? Try fallback to API key ──
+    elif [[ $EXIT_CODE -ne 0 ]] && [[ "$AUTH_MODE" == "oauth" || "$AUTH_MODE" == "setup_token" ]] && [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        if is_auth_error "$LOG_FILE"; then
+            log "AUTH: $AUTH_MODE failed — switching to API key and retrying..."
+            AUTH_MODE="api_key_fallback"
 
             # Clear OAuth env so claude uses ANTHROPIC_API_KEY
             rm -f "$CREDENTIALS_FILE" 2>/dev/null || true
+            unset CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true
 
-            # Send Discord alert with auth link
-            send_auth_alert "OAuth 401/expired — retry en cours avec API key"
+            send_auth_alert "$AUTH_MODE 401/expired — retry avec API key"
 
-            # Retry with API key
             RETRY_LOG="/app/logs/${RUN_TYPE}-${TIMESTAMP}-retry.log"
             log "AUTH: Retrying with ANTHROPIC_API_KEY..."
             run_claude "$PROMPT" "$MAX_TURNS" "$RETRY_LOG"
             EXIT_CODE=$?
 
-            # Append retry log to main log
             cat "$RETRY_LOG" >> "$LOG_FILE" 2>/dev/null || true
             log "AUTH: Retry completed (exit=$EXIT_CODE)"
+
+            # Check if API key also has billing issues
+            if [[ $EXIT_CODE -ne 0 ]] && is_billing_error "$RETRY_LOG"; then
+                log "BILLING: API key also out of credits"
+                send_billing_alert "api_key_fallback"
+            fi
         fi
+
+    # ── Auth error but no API key fallback available ──
+    elif [[ $EXIT_CODE -ne 0 ]] && is_auth_error "$LOG_FILE"; then
+        send_auth_alert "$AUTH_MODE failed — pas de fallback API key disponible"
     fi
 fi
 
 log "Session completed (exit: $EXIT_CODE, auth: $AUTH_MODE)"
 
 # ==================================================================
-# 5. OAUTH: PERSIST REFRESHED TOKENS (only if OAuth succeeded)
+# 5. OAUTH: PERSIST REFRESHED TOKENS (only for legacy oauth mode)
 # ==================================================================
-if [[ "$AUTH_MODE" == "oauth" ]] && [[ -f "$CREDENTIALS_FILE" ]] && [[ -s "$CREDENTIALS_FILE" ]]; then
-    NEW_EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDENTIALS_FILE" 2>/dev/null || echo "0")
-    OLD_EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$BACKUP_FILE" 2>/dev/null || echo "0")
+# setup_token doesn't need persistence — it's static for 1 year.
+if [[ "$AUTH_MODE" == "oauth" ]]; then
+    if [[ -f "$CREDENTIALS_FILE" ]] && [[ -s "$CREDENTIALS_FILE" ]]; then
+        NEW_EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDENTIALS_FILE" 2>/dev/null || echo "0")
+        OLD_EXPIRES=$(jq -r '.claudeAiOauth.expiresAt // 0' "$BACKUP_FILE" 2>/dev/null || echo "0")
 
-    if [[ "$NEW_EXPIRES" != "$OLD_EXPIRES" ]]; then
-        log "AUTH: Tokens refreshed — persisting to Secret Manager"
-        NEW_CREDS_B64=$(base64 -w 0 < "$CREDENTIALS_FILE")
+        if [[ "$NEW_EXPIRES" != "$OLD_EXPIRES" ]]; then
+            log "AUTH: Tokens refreshed — persisting to Secret Manager"
+            NEW_CREDS_B64=$(base64 -w 0 < "$CREDENTIALS_FILE")
 
-        if [[ -n "${SCW_SECRET_KEY:-}" ]] && [[ -n "${CREDENTIALS_SECRET_ID:-}" ]]; then
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-                "https://api.scaleway.com/secret-manager/v1beta1/regions/${SCW_DEFAULT_REGION:-fr-par}/secrets/${CREDENTIALS_SECRET_ID}/versions" \
-                -H "X-Auth-Token: $SCW_SECRET_KEY" \
-                -H "Content-Type: application/json" \
-                -d "{\"data\": \"$NEW_CREDS_B64\"}")
+            if [[ -n "${SCW_SECRET_KEY:-}" ]] && [[ -n "${CREDENTIALS_SECRET_ID:-}" ]]; then
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                    "https://api.scaleway.com/secret-manager/v1beta1/regions/${SCW_DEFAULT_REGION:-fr-par}/secrets/${CREDENTIALS_SECRET_ID}/versions" \
+                    -H "X-Auth-Token: $SCW_SECRET_KEY" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"data\": \"$NEW_CREDS_B64\"}")
 
-            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]]; then
-                log "AUTH: Secret Manager updated (HTTP $HTTP_CODE)"
-            else
-                log "AUTH: WARNING — Secret Manager update failed (HTTP $HTTP_CODE)"
+                if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]]; then
+                    log "AUTH: Secret Manager updated (HTTP $HTTP_CODE)"
+                else
+                    log "AUTH: WARNING — Secret Manager update failed (HTTP $HTTP_CODE)"
+                fi
             fi
+        else
+            log "AUTH: Tokens unchanged"
         fi
-    else
-        log "AUTH: Tokens unchanged"
-    fi
-elif [[ "$AUTH_MODE" == "oauth" ]]; then
-    # Credentials wiped (issue #29896) — restore backup
-    if [[ -f "$BACKUP_FILE" ]] && [[ ! -s "$CREDENTIALS_FILE" ]]; then
+    elif [[ -f "$BACKUP_FILE" ]] && [[ ! -s "$CREDENTIALS_FILE" ]]; then
         log "AUTH: Credentials wiped — restoring backup"
         cp "$BACKUP_FILE" "$CREDENTIALS_FILE"
     fi

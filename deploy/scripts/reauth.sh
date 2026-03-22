@@ -2,19 +2,12 @@
 set -euo pipefail
 
 # ==================================================================
-# reauth.sh — Re-authenticate Claude Code OAuth and push to Scaleway
+# reauth.sh — Re-authenticate Claude Code and push to Scaleway jobs
 #
-# Run this on your local machine when you get a Discord alert:
-#   "AUTH FAIL — Re-auth required"
-#
-# Prerequisites:
-#   - Claude Code installed (npm install -g @anthropic-ai/claude-code)
-#   - Scaleway CLI configured (scw init)
-#   - .env.local with CREDENTIALS_SECRET_ID and CONFIG_SECRET_ID
-#
-# Usage:
-#   bash deploy/scripts/reauth.sh
-#   bash deploy/scripts/reauth.sh --test  # also trigger a test run
+# Two modes:
+#   bash deploy/scripts/reauth.sh              # setup-token (recommended)
+#   bash deploy/scripts/reauth.sh --legacy     # legacy OAuth (8h tokens)
+#   bash deploy/scripts/reauth.sh --test       # also trigger a test run
 # ==================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,103 +17,129 @@ SCW=~/.local/bin/scw
 
 log() { echo "[reauth] $*"; }
 
-# ─── Step 1: Re-authenticate ───
-log "Step 1: Opening Claude Code auth flow..."
-claude auth login
-log "Auth flow completed."
+MODE="setup-token"
+TRIGGER_TEST=false
+for arg in "$@"; do
+    case "$arg" in
+        --legacy) MODE="legacy" ;;
+        --test)   TRIGGER_TEST=true ;;
+    esac
+done
 
-# ─── Step 2: Verify auth works ───
-log "Step 2: Verifying auth..."
-RESULT=$(claude -p "Say OK" --output-format text 2>&1) || {
-    log "ERROR: claude -p failed after re-auth. Check manually."
-    exit 1
-}
-log "Verified: claude -p works ($RESULT)"
+# Read job IDs
+source ~/.trappist-jobs 2>/dev/null || true
+CYCLE_ID="${CYCLE_ID:-20c225c4-05f1-4e79-8b0b-a6ed052acb31}"
+PROTECT_ID="${PROTECT_ID:-e00d3f69-1f47-4cc6-b497-3f8d228bee8f}"
 
-# ─── Step 3: Encode credentials ───
-log "Step 3: Encoding credentials..."
+if [[ "$MODE" == "setup-token" ]]; then
+    # ─── SETUP TOKEN MODE (recommended) ───
+    log "=== Setup Token Mode (1 year, no refresh needed) ==="
 
-CREDS_FILE="$HOME/.claude/.credentials.json"
-CONFIG_FILE="$HOME/.claude.json"
+    log "Step 1: Generating setup token..."
+    log "Run this command and paste the token:"
+    echo ""
+    echo "  claude setup-token"
+    echo ""
+    read -rp "Paste the token (sk-ant-oat01-...): " SETUP_TOKEN
 
-if [[ ! -f "$CREDS_FILE" ]]; then
-    log "ERROR: $CREDS_FILE not found after auth"
-    exit 1
-fi
-
-CREDS_B64=$(base64 -w 0 < "$CREDS_FILE")
-CONFIG_B64=""
-if [[ -f "$CONFIG_FILE" ]]; then
-    CONFIG_B64=$(base64 -w 0 < "$CONFIG_FILE")
-fi
-
-log "Encoded: credentials ($(echo -n "$CREDS_B64" | wc -c) chars)"
-
-# ─── Step 4: Push to Scaleway Secret Manager ───
-log "Step 4: Pushing to Scaleway Secret Manager..."
-
-# Read secret IDs from .env.local
-if [[ -f "$ENV_FILE" ]]; then
-    CREDENTIALS_SECRET_ID=$(bash -c "source '$ENV_FILE' 2>/dev/null; echo \"\${CREDENTIALS_SECRET_ID:-}\"")
-    CONFIG_SECRET_ID=$(bash -c "source '$ENV_FILE' 2>/dev/null; echo \"\${CONFIG_SECRET_ID:-}\"")
-else
-    log "WARNING: $ENV_FILE not found — reading secret IDs from env"
-    CREDENTIALS_SECRET_ID="${CREDENTIALS_SECRET_ID:-}"
-    CONFIG_SECRET_ID="${CONFIG_SECRET_ID:-}"
-fi
-
-if [[ -n "$CREDENTIALS_SECRET_ID" ]]; then
-    $SCW secret version create \
-        secret-id="$CREDENTIALS_SECRET_ID" \
-        data="$CREDS_B64" \
-        region=fr-par \
-        -o human 2>&1 && log "Credentials secret updated" || log "ERROR: Failed to update credentials secret"
-else
-    log "WARNING: CREDENTIALS_SECRET_ID not set — skipping Secret Manager push"
-    log "Encoded credentials (set manually):"
-    log "  CLAUDE_CREDENTIALS_B64=$CREDS_B64"
-fi
-
-if [[ -n "$CONFIG_B64" ]] && [[ -n "${CONFIG_SECRET_ID:-}" ]]; then
-    $SCW secret version create \
-        secret-id="$CONFIG_SECRET_ID" \
-        data="$CONFIG_B64" \
-        region=fr-par \
-        -o human 2>&1 && log "Config secret updated" || log "ERROR: Failed to update config secret"
-fi
-
-# ─── Step 5: Update .env.local ───
-log "Step 5: Updating .env.local..."
-if [[ -f "$ENV_FILE" ]]; then
-    # Update or add CLAUDE_CREDENTIALS_B64
-    if grep -q "^CLAUDE_CREDENTIALS_B64=" "$ENV_FILE"; then
-        sed -i "s|^CLAUDE_CREDENTIALS_B64=.*|CLAUDE_CREDENTIALS_B64=$CREDS_B64|" "$ENV_FILE"
-    else
-        echo "CLAUDE_CREDENTIALS_B64=$CREDS_B64" >> "$ENV_FILE"
+    if [[ ! "$SETUP_TOKEN" =~ ^sk-ant- ]]; then
+        log "ERROR: Invalid token format. Expected sk-ant-oat01-..."
+        exit 1
     fi
-    # Update or add CLAUDE_CONFIG_B64
-    if [[ -n "$CONFIG_B64" ]]; then
-        if grep -q "^CLAUDE_CONFIG_B64=" "$ENV_FILE"; then
-            sed -i "s|^CLAUDE_CONFIG_B64=.*|CLAUDE_CONFIG_B64=$CONFIG_B64|" "$ENV_FILE"
+
+    log "Step 2: Verifying token..."
+    RESULT=$(CLAUDE_CODE_OAUTH_TOKEN="$SETUP_TOKEN" claude -p "Say OK" --output-format text 2>&1) || {
+        log "ERROR: Token verification failed: $RESULT"
+        exit 1
+    }
+    log "Verified: $RESULT"
+
+    log "Step 3: Updating .env.local..."
+    if [[ -f "$ENV_FILE" ]]; then
+        if grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$ENV_FILE"; then
+            sed -i "s|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=$SETUP_TOKEN|" "$ENV_FILE"
         else
-            echo "CLAUDE_CONFIG_B64=$CONFIG_B64" >> "$ENV_FILE"
+            echo "CLAUDE_CODE_OAUTH_TOKEN=$SETUP_TOKEN" >> "$ENV_FILE"
+        fi
+    else
+        echo "CLAUDE_CODE_OAUTH_TOKEN=$SETUP_TOKEN" >> "$ENV_FILE"
+    fi
+    log ".env.local updated"
+
+    log "Step 4: Pushing token to Scaleway jobs..."
+    for JOB_ID in "$CYCLE_ID" "$PROTECT_ID"; do
+        JOB_NAME=$($SCW jobs definition get "$JOB_ID" region=fr-par -o json 2>/dev/null | jq -r '.name // "unknown"')
+        $SCW jobs definition update "$JOB_ID" \
+            region=fr-par \
+            environment-variables.CLAUDE_CODE_OAUTH_TOKEN="$SETUP_TOKEN" \
+            -o human 2>&1 && log "Updated job $JOB_NAME ($JOB_ID)" || log "WARNING: Failed to update $JOB_ID"
+    done
+
+else
+    # ─── LEGACY OAUTH MODE ───
+    log "=== Legacy OAuth Mode (8h tokens, needs refresh) ==="
+
+    log "Step 1: Opening Claude Code auth flow..."
+    claude auth login
+    log "Auth flow completed."
+
+    log "Step 2: Verifying auth..."
+    RESULT=$(claude -p "Say OK" --output-format text 2>&1) || {
+        log "ERROR: claude -p failed after re-auth."
+        exit 1
+    }
+    log "Verified: $RESULT"
+
+    log "Step 3: Encoding credentials..."
+    CREDS_FILE="$HOME/.claude/.credentials.json"
+    CONFIG_FILE="$HOME/.claude.json"
+
+    if [[ ! -f "$CREDS_FILE" ]]; then
+        log "ERROR: $CREDS_FILE not found after auth"
+        exit 1
+    fi
+
+    CREDS_B64=$(base64 -w 0 < "$CREDS_FILE")
+    CONFIG_B64=""
+    [[ -f "$CONFIG_FILE" ]] && CONFIG_B64=$(base64 -w 0 < "$CONFIG_FILE")
+    log "Encoded: credentials ($(echo -n "$CREDS_B64" | wc -c) chars)"
+
+    log "Step 4: Pushing to Scaleway Secret Manager..."
+    if [[ -f "$ENV_FILE" ]]; then
+        CREDENTIALS_SECRET_ID=$(bash -c "source '$ENV_FILE' 2>/dev/null; echo \"\${CREDENTIALS_SECRET_ID:-}\"")
+    fi
+
+    if [[ -n "${CREDENTIALS_SECRET_ID:-}" ]]; then
+        $SCW secret version create \
+            secret-id="$CREDENTIALS_SECRET_ID" \
+            data="$CREDS_B64" \
+            region=fr-par \
+            -o human 2>&1 && log "Secret Manager updated" || log "ERROR: Failed to update secret"
+    fi
+
+    log "Step 5: Updating .env.local..."
+    if [[ -f "$ENV_FILE" ]]; then
+        if grep -q "^CLAUDE_CREDENTIALS_B64=" "$ENV_FILE"; then
+            sed -i "s|^CLAUDE_CREDENTIALS_B64=.*|CLAUDE_CREDENTIALS_B64=$CREDS_B64|" "$ENV_FILE"
+        else
+            echo "CLAUDE_CREDENTIALS_B64=$CREDS_B64" >> "$ENV_FILE"
+        fi
+        if [[ -n "$CONFIG_B64" ]]; then
+            if grep -q "^CLAUDE_CONFIG_B64=" "$ENV_FILE"; then
+                sed -i "s|^CLAUDE_CONFIG_B64=.*|CLAUDE_CONFIG_B64=$CONFIG_B64|" "$ENV_FILE"
+            else
+                echo "CLAUDE_CONFIG_B64=$CONFIG_B64" >> "$ENV_FILE"
+            fi
         fi
     fi
-    log ".env.local updated with fresh credentials"
 fi
 
-# ─── Step 6 (optional): Trigger test run ───
-if [[ "${1:-}" == "--test" ]]; then
-    log "Step 6: Triggering test run..."
-    source ~/.trappist-jobs 2>/dev/null || true
-    if [[ -n "${CYCLE_ID:-}" ]]; then
-        $SCW jobs definition start "$CYCLE_ID" region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'
-        log "Test run triggered. Check bot-status in a few minutes."
-    else
-        log "WARNING: No job IDs found in ~/.trappist-jobs — skip test run"
-    fi
+# ─── Optional test run ───
+if [[ "$TRIGGER_TEST" == true ]]; then
+    log "Triggering test run..."
+    $SCW jobs definition start "$CYCLE_ID" region=fr-par -o json | jq '{job_runs: [.job_runs[] | {id, state}]}'
+    log "Test run triggered. Check Discord in ~5 minutes."
 fi
 
 log ""
-log "Re-auth complete. Next CRON run will use the new tokens."
-log "Time: ~2 minutes. Good job."
+log "Re-auth complete ($MODE). Next CRON run will use the new auth."
