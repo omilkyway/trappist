@@ -159,19 +159,40 @@ def cmd_scan(args):
     else:
         pairs = get_active_pairs()
 
+    print(f"[scan] Universe: {len(pairs)} pairs", flush=True)
+
     # Pass 1: Quick pre-filter — only analyze pairs worth looking at
+    # With dynamic discovery (80+ pairs), we need to be selective
     candidates = []
+    core = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
     for sym in pairs:
         try:
             t = get_ticker(sym)
             change = abs(t.get("change_pct", 0))
             vol = t.get("volume_24h", 0)
-            # Keep: movers (>1.5% change), high volume (>$50M), or top 3 always
-            if change > 1.5 or vol > 50_000_000 or sym in pairs[:3]:
+            spread_pct = 0
+            bid, ask = t.get("bid", 0), t.get("ask", 0)
+            if bid and ask and bid > 0:
+                spread_pct = (ask - bid) / bid * 100
+
+            # Keep: big movers, high volume, or core pairs
+            # Skip: wide spreads (> 0.15%) = illiquid = dangerous with leverage
+            if spread_pct > 0.15 and sym not in core:
+                continue
+            if change > 1.5 or vol > 50_000_000 or sym in core:
                 candidates.append((sym, t))
         except Exception:
-            if sym in pairs[:3]:  # Always include BTC, ETH, SOL
+            if sym in core:
                 candidates.append((sym, {}))
+
+    # Cap candidates to avoid excessive API calls (top 25 by volume)
+    candidates.sort(key=lambda x: x[1].get("volume_24h", 0), reverse=True)
+    max_deep = getattr(args, "max_candidates", 25)
+    # Always keep core pairs + top by volume
+    core_candidates = [(s, t) for s, t in candidates if s in core]
+    other_candidates = [(s, t) for s, t in candidates if s not in core]
+    candidates = core_candidates + other_candidates[:max_deep - len(core_candidates)]
+    print(f"[scan] Pass 1: {len(candidates)} candidates after pre-filter", flush=True)
 
     # Pass 2: Deep analysis on filtered candidates
     # Also read account for position sizing

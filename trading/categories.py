@@ -99,9 +99,9 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def get_category(symbol: str) -> str:
-    """Return the market category for a symbol, or 'Unknown' if not mapped."""
+    """Return the market category for a symbol, or 'Other' if not mapped."""
     base = normalize_symbol(symbol)
-    return CATEGORY_MAP.get(base, "Unknown")
+    return CATEGORY_MAP.get(base, "Other")
 
 
 def check_category_limit(
@@ -116,12 +116,9 @@ def check_category_limit(
     """
     new_cat = get_category(new_symbol)
 
-    # Fail-closed: unknown category = blocked
+    # Unknown category = allowed but tracked as "Other"
     if new_cat == "Unknown":
-        return False, (
-            f"BLOCKED: symbol '{new_symbol}' (base: {normalize_symbol(new_symbol)}) "
-            f"has unknown category. Add it to CATEGORY_MAP in categories.py."
-        )
+        new_cat = "Other"
 
     # Count existing positions in same category
     count = 0

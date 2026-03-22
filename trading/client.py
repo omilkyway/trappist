@@ -825,34 +825,104 @@ def get_trades(symbol: str, days: int = 30, limit: int = 500) -> list[dict]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Default pairs to trade (aggressive list)
-DEFAULT_PAIRS = [
+# Core pairs always included regardless of filters
+CORE_PAIRS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
-    "XRP/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LINK/USDT:USDT",
-    "SUI/USDT:USDT",
-    "ARB/USDT:USDT",
-    "NEAR/USDT:USDT",
-    "OP/USDT:USDT",
-    "FET/USDT:USDT",
-    "RENDER/USDT:USDT",
-    "INJ/USDT:USDT",
-    "WIF/USDT:USDT",
-    "PEPE/USDT:USDT",
-    "APT/USDT:USDT",
-    "ATOM/USDT:USDT",
-    "DOT/USDT:USDT",
 ]
+
+# Cache for discovered pairs (refreshed every hour)
+_discovered_pairs_cache: dict = {"pairs": [], "timestamp": 0}
+
+
+def discover_futures_pairs(
+    min_volume_24h: float = 10_000_000,
+    min_leverage: int = 5,
+    max_pairs: int = 80,
+) -> list[str]:
+    """Dynamically discover ALL tradable Binance USDT-M Futures pairs.
+
+    Filters by:
+    - Active trading status
+    - Minimum 24h volume (default $10M)
+    - Minimum leverage available (default 5x)
+    Returns pairs sorted by 24h volume descending, capped at max_pairs.
+    """
+    global _discovered_pairs_cache
+    now = time.time()
+
+    # Use cache if fresh (< 1 hour old)
+    if _discovered_pairs_cache["pairs"] and (now - _discovered_pairs_cache["timestamp"]) < 3600:
+        return _discovered_pairs_cache["pairs"]
+
+    exchange = get_exchange()
+
+    # Get all USDT-M perpetual markets
+    all_symbols = []
+    for sym, market in exchange.markets.items():
+        if (
+            market.get("active")
+            and market.get("settle") == "USDT"
+            and market.get("type") in ("swap", "future")
+            and market.get("linear")
+        ):
+            all_symbols.append(sym)
+
+    logger.info("Discovered %d active USDT-M futures pairs", len(all_symbols))
+
+    # Fetch 24h tickers for volume ranking
+    tickers = {}
+    try:
+        # Try batch fetch first (most efficient)
+        tickers = exchange.fetch_tickers(all_symbols)
+    except Exception:
+        # Fallback: fetch all tickers without symbol filter
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception:
+            logger.warning("Ticker fetch failed entirely, returning all active symbols")
+            # No volume data — return all symbols up to max_pairs (sorted alphabetically)
+            pairs = all_symbols[:max_pairs]
+            for core in CORE_PAIRS:
+                if core not in pairs:
+                    pairs.append(core)
+            _discovered_pairs_cache = {"pairs": pairs, "timestamp": now}
+            return pairs
+
+    # Filter and rank by volume
+    ranked = []
+    for sym in all_symbols:
+        ticker = tickers.get(sym, {})
+        vol = float(ticker.get("quoteVolume", 0) or 0)
+        if vol >= min_volume_24h:
+            ranked.append((sym, vol))
+        elif sym in CORE_PAIRS:
+            ranked.append((sym, vol))  # Always include core
+
+    # Sort by volume descending
+    ranked.sort(key=lambda x: x[1], reverse=True)
+
+    # Cap and ensure core pairs are included
+    pairs = [sym for sym, _ in ranked[:max_pairs]]
+    for core in CORE_PAIRS:
+        if core not in pairs:
+            pairs.append(core)
+
+    logger.info("Selected %d pairs (min vol $%.0fM, from %d candidates)",
+                len(pairs), min_volume_24h / 1e6, len(ranked))
+
+    _discovered_pairs_cache = {"pairs": pairs, "timestamp": now}
+    return pairs
 
 
 def get_active_pairs() -> list[str]:
-    """Return list of active trading pairs."""
-    return DEFAULT_PAIRS
+    """Return list of active trading pairs — dynamically discovered from Binance."""
+    try:
+        return discover_futures_pairs()
+    except Exception as e:
+        logger.warning("Dynamic discovery failed (%s), using core pairs", e)
+        return CORE_PAIRS
 
 
 def format_symbol(base: str) -> str:

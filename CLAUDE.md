@@ -94,11 +94,21 @@ The scan calculates `suggested_qty` — USE IT, don't invent sizes.
 - Scan provides multi-TF + regime + squeeze + suggested leverage
 - 0 trades per cycle is NORMAL in ranging markets — it's not a missed opportunity
 
+## Universe & Discovery
+
+**Dynamic**: The scan auto-discovers ALL Binance USDT-M Futures pairs every hour.
+- Filters: 24h volume > $10M, spread < 0.15%, active status
+- Typically 60-80 pairs, ranked by volume
+- Core (BTC, ETH, SOL) always included
+- Pre-filter keeps top 25 movers for deep TA
+
+**Use news & web search** to find catalysts BEFORE scanning. If a token is trending
+(CryptoPanic, Gloria, WebSearch), scan it explicitly: `--pairs TOKEN`
+
 ## Categories (max 3 per category)
 
-Store of Value (BTC) · Smart Contract L1 (ETH, SOL, AVAX, SUI) · Layer 2 (ARB, OP) ·
-Exchange Token (BNB) · DeFi (LINK, UNI, AAVE) · Meme (DOGE, PEPE, WIF) ·
-AI (FET, RENDER) · Payment (XRP, LTC)
+Store of Value · Smart Contract L1 · Layer 2 · Exchange Token · DeFi · Meme ·
+AI · Payment · Gaming · Infrastructure · Staking · Other (uncategorized tokens)
 
 ## Config
 
