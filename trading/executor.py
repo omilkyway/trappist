@@ -523,11 +523,30 @@ def cmd_protect(args):
     orders = get_open_orders()
     account = get_account()
 
-    if not positions:
-        print(json.dumps({"status": "no_positions", "actions": []}, indent=2))
-        return 0
-
     actions = []
+
+    # --- Cleanup orphaned orders (SL/TP for positions that no longer exist) ---
+    position_symbols = {p["symbol"] for p in positions}
+    orphaned = [o for o in orders if o["symbol"] not in position_symbols and o.get("reduce_only")]
+    if orphaned:
+        orphan_symbols = set()
+        for o in orphaned:
+            orphan_symbols.add(o["symbol"])
+        for sym in orphan_symbols:
+            try:
+                cancel_all_orders(sym)
+                count = sum(1 for o in orphaned if o["symbol"] == sym)
+                actions.append({"symbol": sym, "action": "CANCEL_ORPHANED",
+                               "count": count, "reason": "no open position"})
+            except Exception as e:
+                actions.append({"symbol": sym, "action": "CANCEL_ORPHANED_FAILED",
+                               "error": str(e)})
+        print(f"[protect] Cleaned {len(orphaned)} orphaned orders across {len(orphan_symbols)} symbols")
+
+    if not positions:
+        print(json.dumps({"status": "no_positions", "orphaned_cleaned": len(orphaned),
+                          "actions": actions}, indent=2))
+        return 0
 
     for pos in positions:
         sym = pos["symbol"]
