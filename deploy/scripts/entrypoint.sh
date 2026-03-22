@@ -194,6 +194,14 @@ run_claude() {
     local MAX_TURNS="$2"
     local LOG_FILE="$3"
 
+    # CRITICAL: Claude CLI prioritizes ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN.
+    # When using setup-token or oauth, hide the API key so Claude uses the right auth.
+    local SAVED_API_KEY="${ANTHROPIC_API_KEY:-}"
+    if [[ "$AUTH_MODE" == "setup_token" || "$AUTH_MODE" == "oauth" ]]; then
+        unset ANTHROPIC_API_KEY
+        log "AUTH: Hidden ANTHROPIC_API_KEY — Claude will use $AUTH_MODE"
+    fi
+
     # Build plugin-dir flags
     local PLUGIN_ARGS=""
     for pdir in /app/plugins/*/; do
@@ -213,6 +221,12 @@ run_claude() {
         2>&1 | tee "$LOG_FILE"
     local CODE=${PIPESTATUS[0]}
     set -e
+
+    # Restore API key for potential fallback retry
+    if [[ -n "$SAVED_API_KEY" ]]; then
+        export ANTHROPIC_API_KEY="$SAVED_API_KEY"
+    fi
+
     return $CODE
 }
 
