@@ -1,10 +1,27 @@
 {
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/risk_guardian.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
       "Bash(*)",
       "Read",
       "Write",
-      "WebSearch"
+      "WebSearch",
+      "mcp__fear-greed__*",
+      "mcp__gloria-news__*",
+      "mcp__tradingview__*"
     ],
     "deny": []
   }
