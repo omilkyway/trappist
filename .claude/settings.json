@@ -1,6 +1,21 @@
 {
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/risk_guardian.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
+      "Bash(.venv/bin/python trading/*)",
       "Bash(python trading/*)",
       "Bash(python3 trading/*)",
       "Bash(source .venv/*)",
@@ -13,7 +28,6 @@
       "Bash(cat keys.local.json*)",
       "Read",
       "Write",
-      "mcp__binance-futures__*",
       "mcp__fear-greed__*",
       "mcp__gloria-news__*",
       "mcp__tradingview__*"

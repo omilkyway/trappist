@@ -18,7 +18,7 @@ mkdir -p logs
 echo "=== TRAPPIST | $COMMAND | $(date -u) ===" | tee "$LOG"
 
 claude --print \
-  --allowedTools "Bash(python trading/*),Bash(source .venv/*),Bash(curl*),Read,Write,WebSearch,mcp__binance-futures__*,mcp__fear-greed__*,mcp__gloria-news__*,mcp__tradingview__*,mcp__cryptopanic__*,mcp__crypto-price__*" \
+  --allowedTools "Bash(.venv/bin/python trading/*),Bash(python trading/*),Bash(source .venv/*),Bash(curl*),Read,Write,WebSearch,mcp__fear-greed__*,mcp__gloria-news__*,mcp__tradingview__*" \
   "$COMMAND" \
   2>&1 | tee -a "$LOG"
 

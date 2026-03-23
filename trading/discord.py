@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -65,14 +66,14 @@ def _load_trade_context() -> dict:
     for path in ["trade_context.json", "/app/trade_context.json"]:
         try:
             with open(path) as f:
-                import json
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             continue
     return {}
 
 
-def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0) -> dict:
+def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0,
+                       model: str = "", tokens: int = 0, duration: int = 0) -> dict:
     """Build single merged embed for trading cycle run."""
     acct = _safe(get_account, {})
     positions = _safe(get_positions, [])
@@ -139,17 +140,27 @@ def _build_cycle_embed(exit_code: int, cost: float = 0, turns: int = 0) -> dict:
         fields.append({"name": "Reasoning", "value": ctx["reasoning"][:1024], "inline": False})
 
     # Session meta
+    meta_parts = []
     if cost > 0:
-        fields.append({"name": "Session Cost", "value": f"`${cost:.2f}`", "inline": True})
+        meta_parts.append(f"${cost:.2f}")
     if turns > 0:
-        fields.append({"name": "Turns", "value": f"`{turns}`", "inline": True})
+        meta_parts.append(f"{turns} turns")
+    if model and model != "unknown":
+        meta_parts.append(model)
+    if tokens and tokens > 0:
+        meta_parts.append(f"{tokens:,} tok")
+    if duration and duration > 0:
+        mins, secs = divmod(duration, 60)
+        meta_parts.append(f"{mins}m{secs:02d}s")
+    if meta_parts:
+        fields.append({"name": "\u2699\ufe0f Session", "value": " \u2022 ".join(meta_parts), "inline": False})
 
     return {
         "title": f"\U0001fa90 TRAPPIST Trading Cycle {'Complete' if exit_code == 0 else 'FAILED'}",
         "color": color,
         "fields": fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": f"trappist v2.0 • exit {exit_code}"},
+        "footer": {"text": f"trappist v3.0 • exit {exit_code}"},
     }
 
 
@@ -250,6 +261,9 @@ def main():
     parser.add_argument("--exit-code", type=int, default=0)
     parser.add_argument("--cost", type=float, default=0)
     parser.add_argument("--turns", type=int, default=0)
+    parser.add_argument("--model", default="")
+    parser.add_argument("--tokens", type=int, default=0)
+    parser.add_argument("--duration", type=int, default=0)
     parser.add_argument("--error-msg", default="")
     parser.add_argument("--webhook-url", default=None)
     parser.add_argument("--test", action="store_true")
@@ -265,7 +279,8 @@ def main():
     elif args.exit_code != 0 and args.run_type != "protect":
         embed = _build_error_embed(args.run_type, args.exit_code, args.error_msg)
     elif args.run_type == "cycle":
-        embed = _build_cycle_embed(args.exit_code, args.cost, args.turns)
+        embed = _build_cycle_embed(args.exit_code, args.cost, args.turns,
+                                    args.model, args.tokens, args.duration)
     elif args.run_type == "protect":
         embed = _build_protect_embed(args.exit_code)
     else:

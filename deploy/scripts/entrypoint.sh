@@ -3,6 +3,7 @@ set -euo pipefail
 
 RUN_TYPE="${1:-${RUN_TYPE:-cycle}}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+JOB_START_TS=$(date +%s)
 S3_BUCKET="s3://trappist"
 S3_ENABLED="${SCW_S3_ACCESS_KEY:-}"
 
@@ -133,8 +134,8 @@ if [[ -n "$S3_ENABLED" ]]; then
         LOCK_TS=$(echo "$LOCK_CONTENT" | head -1)
         NOW_TS=$(date +%s)
         LOCK_AGE=$(( NOW_TS - LOCK_TS ))
-        if [[ $LOCK_AGE -lt 300 ]]; then
-            log "DEDUP: Another $RUN_TYPE run started ${LOCK_AGE}s ago (< 300s). Skipping."
+        if [[ $LOCK_AGE -lt 3600 ]]; then
+            log "DEDUP: Another $RUN_TYPE run started ${LOCK_AGE}s ago (< 3600s). Skipping."
             exit 0
         fi
         log "DEDUP: Stale lock found (${LOCK_AGE}s old). Proceeding."
@@ -145,6 +146,7 @@ if [[ -n "$S3_ENABLED" ]]; then
     aws s3 cp $S3_EP "$S3_BUCKET/progress.md" /app/progress.md 2>/dev/null || echo "# Trading Progress" > /app/progress.md
     aws s3 cp $S3_EP "$S3_BUCKET/pending_protections.json" /app/pending_protections.json 2>/dev/null || echo "[]" > /app/pending_protections.json
     aws s3 cp $S3_EP "$S3_BUCKET/state.json" /app/state.json 2>/dev/null || echo '{"initial_balance":0,"killed":false,"trades":[]}' > /app/state.json
+    aws s3 cp $S3_EP "$S3_BUCKET/scan_history.json" /app/scan_history.json 2>/dev/null || echo '[]' > /app/scan_history.json
     aws s3 sync $S3_EP "$S3_BUCKET/reports/" /app/reports/ 2>/dev/null || true
 else
     log "S3 not configured — using ephemeral storage"
@@ -156,8 +158,8 @@ fi
 # 2. RECONCILE (prevents phantom position blocking)
 # ==================================================================
 if [[ "$RUN_TYPE" == "cycle" ]]; then
-    log "Reconciling: fix protection + sync state..."
-    /app/.venv/bin/python /app/trading/executor.py protect 2>&1 || log "WARNING: Reconciliation failed (non-fatal)"
+    log "Reconciling: fix protection + trail stops + sync state..."
+    /app/.venv/bin/python /app/trading/executor.py protect --trail 2>&1 || log "WARNING: Reconciliation failed (non-fatal)"
 fi
 
 # ==================================================================
@@ -167,12 +169,12 @@ case "$RUN_TYPE" in
   cycle)
     log "=== TRADING CYCLE — Full crypto pipeline (24/7) ==="
     PROMPT="/trade"
-    MAX_TURNS=35
+    MAX_TURNS=100
     ;;
   review)
     log "=== PORTFOLIO REVIEW — Position management ==="
     PROMPT="Run portfolio review: source .venv/bin/activate && python trading/executor.py protect --trail --max-days 10 && python trading/executor.py status"
-    MAX_TURNS=10
+    MAX_TURNS=50
     ;;
   protect)
     log "=== PROTECTION CHECK ==="
@@ -213,7 +215,8 @@ run_claude() {
     set +e
     claude -p "$PROMPT" \
         --dangerously-skip-permissions \
-        --model claude-opus-4-6 \
+        --model 'claude-opus-4-6[1m]' \
+        --effort high \
         --max-turns "$MAX_TURNS" \
         --output-format stream-json \
         --verbose \
@@ -344,28 +347,44 @@ LOG_FILE="/app/logs/${RUN_TYPE}-${TIMESTAMP}.log"
 TOTAL_TOKENS=0
 TOTAL_COST=0
 TOTAL_TURNS=0
+SESSION_MODEL="unknown"
+SESSION_DURATION=0
 if [[ -f "$LOG_FILE" ]]; then
     TOTAL_TURNS=$(grep -c '"type":"assistant"' "$LOG_FILE" 2>/dev/null || echo "0")
-    TOTAL_TOKENS=$(grep '"type":"result"' "$LOG_FILE" 2>/dev/null | python3 -c "
-import sys, json
-total = 0
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        total += d.get('total_input_tokens', 0) + d.get('total_output_tokens', 0)
-    except: pass
-print(total)
-" 2>/dev/null || echo "0")
-    TOTAL_COST=$(grep '"type":"result"' "$LOG_FILE" 2>/dev/null | python3 -c "
-import sys, json
+    # Extract model from first assistant message, tokens+cost from result line
+    read SESSION_MODEL TOTAL_TOKENS TOTAL_COST <<< $(python3 -c "
+import json, sys
+model = 'unknown'
+tokens = 0
 cost = 0
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        cost = max(cost, d.get('total_cost_usd', 0))
-    except: pass
-print(f'{cost:.4f}')
-" 2>/dev/null || echo "0")
+with open('$LOG_FILE') as f:
+    for line in f:
+        try:
+            d = json.loads(line.strip())
+            if d.get('type') == 'assistant' and model == 'unknown':
+                m = d.get('message', {}).get('model', '')
+                if m: model = m
+            if d.get('type') == 'result':
+                cost = d.get('total_cost_usd', 0)
+                u = d.get('usage', {})
+                tokens = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0) + u.get('output_tokens', 0)
+                # Get context window from modelUsage
+                mu = d.get('modelUsage', {})
+                for mname, mdata in mu.items():
+                    if mdata.get('contextWindow', 0) >= 1000000:
+                        model = mname + '[1m]'
+                        break
+                    elif model == 'unknown' and mname:
+                        model = mname
+        except: pass
+print(f'{model} {tokens} {cost:.4f}')
+" 2>/dev/null || echo "unknown 0 0")
+    # Duration in seconds since job started
+    if [[ -n "${JOB_START_TS:-}" ]]; then
+        SESSION_DURATION=$(( $(date +%s) - JOB_START_TS ))
+    else
+        SESSION_DURATION=$(( $(date +%s) - $(date -d "${TIMESTAMP:0:8} ${TIMESTAMP:9:2}:${TIMESTAMP:11:2}:${TIMESTAMP:13:2}" +%s 2>/dev/null || echo "$(date +%s)") ))
+    fi
 fi
 
 python3 -c "
@@ -396,6 +415,7 @@ if [[ -n "$S3_ENABLED" ]]; then
     aws s3 cp $S3_EP /app/progress.md "$S3_BUCKET/progress.md" || log "WARNING: S3 upload progress.md failed"
     aws s3 cp $S3_EP /app/pending_protections.json "$S3_BUCKET/pending_protections.json" || log "WARNING: S3 upload pending_protections.json failed"
     aws s3 cp $S3_EP /app/state.json "$S3_BUCKET/state.json" || log "WARNING: S3 upload state.json failed"
+    aws s3 cp $S3_EP /app/scan_history.json "$S3_BUCKET/scan_history.json" || log "WARNING: S3 upload scan_history.json failed"
     aws s3 sync $S3_EP /app/reports/ "$S3_BUCKET/reports/" || log "WARNING: S3 sync reports failed"
     aws s3 sync $S3_EP /app/logs/ "$S3_BUCKET/logs/" --exclude "*.log" --include "${RUN_TYPE}-${TIMESTAMP}.log" --include "session_metrics_*.json" || log "WARNING: S3 sync logs failed"
     aws s3 rm $S3_EP "${S3_BUCKET}/.lock_${RUN_TYPE}" 2>/dev/null || true
@@ -415,6 +435,9 @@ if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
         --exit-code "$EXIT_CODE" \
         --cost "$TOTAL_COST" \
         --turns "$TOTAL_TURNS" \
+        --model "$SESSION_MODEL" \
+        --tokens "$TOTAL_TOKENS" \
+        --duration "$SESSION_DURATION" \
         2>&1 || log "Discord notification failed (non-fatal)"
 fi
 

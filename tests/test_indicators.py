@@ -140,7 +140,7 @@ class TestFundingRateSignal:
 
     def test_extreme_negative_strong_long(self):
         result = funding_rate_signal(-0.08)
-        assert result["long_score"] == 3
+        assert result["long_score"] == 5
 
     def test_positive_short_bias(self):
         result = funding_rate_signal(0.06)
@@ -149,7 +149,7 @@ class TestFundingRateSignal:
 
     def test_extreme_positive_strong_short(self):
         result = funding_rate_signal(0.12)
-        assert result["short_score"] == 3
+        assert result["short_score"] == 5
 
 
 class TestComputeSignals:

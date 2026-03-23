@@ -42,7 +42,7 @@ class TestGetCategory:
         assert get_category("ETH/USDT:USDT") == "Smart Contract L1"
 
     def test_unknown_symbol(self):
-        assert get_category("FAKETOKEN") == "Unknown"
+        assert get_category("FAKETOKEN") == "Other"
 
     def test_all_mapped_symbols_have_category(self):
         for sym, cat in CATEGORY_MAP.items():
@@ -56,11 +56,10 @@ class TestCheckCategoryLimit:
         assert ok
         assert "0/3" in reason
 
-    def test_blocks_unknown_symbol(self):
+    def test_allows_unknown_symbol_as_other(self):
         ok, reason = check_category_limit("FAKETOKEN", [])
-        assert not ok
-        assert "BLOCKED" in reason
-        assert "unknown category" in reason
+        assert ok
+        assert "Other" in reason
 
     def test_allows_different_category(self):
         positions = [{"symbol": "BTC/USDT:USDT"}]  # Store of Value

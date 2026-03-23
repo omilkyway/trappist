@@ -89,7 +89,7 @@ CYCLE_ID=$($SCW jobs definition create \
     environment-variables.RUN_TYPE="cycle" \
     "${ENV_COMMON[@]}" \
     job-timeout=2700s \
-    cron-schedule.schedule="*/15 * * * *" \
+    cron-schedule.schedule="*/30 * * * *" \
     cron-schedule.timezone="UTC" \
     region=fr-par \
     -o json | jq -r '.id')
@@ -144,7 +144,7 @@ echo "=== Jobs created successfully ==="
 echo "Job IDs saved to ~/.trappist-jobs"
 echo ""
 echo "Cron schedules (UTC, 24/7):"
-echo "  Trading Cycle:     */15 * * * *  (every 15 min)"
+echo "  Trading Cycle:     */30 * * * *  (every 30 min)"
 echo "  Protection Check:  */5 * * * *   (every 5 min, no LLM)"
 echo "  Portfolio Review:  0 */4 * * *   (every 4 hours)"
 echo ""

@@ -22,22 +22,7 @@ from pathlib import Path
 
 # Read-only tools that never need blocking
 READONLY_TOOLS = {
-    "mcp__binance-futures__get_account_summary",
-    "mcp__binance-futures__get_balance",
-    "mcp__binance-futures__get_positions",
-    "mcp__binance-futures__get_open_orders",
-    "mcp__binance-futures__get_order",
-    "mcp__binance-futures__get_klines",
-    "mcp__binance-futures__get_ticker",
-    "mcp__binance-futures__get_order_book",
-    "mcp__binance-futures__get_recent_trades",
-    "mcp__binance-futures__get_symbol_info",
-    "mcp__binance-futures__get_leverage_brackets",
-    "mcp__binance-futures__get_trade_history",
-    "mcp__binance-futures__get_order_history",
-    "mcp__binance-futures__get_position_mode",
-    "mcp__binance-futures__ping",
-    # Other read-only MCP tools
+    # Read-only MCP tools (no binance MCP — all exchange access via Python client.py)
     "mcp__fear-greed__get_current_fng_tool",
     "mcp__fear-greed__get_historical_fng_tool",
     "mcp__fear-greed__analyze_fng_trend",

@@ -968,3 +968,96 @@ def price_precision(symbol: str) -> int:
         return max(0, -int(math.log10(float(prec))))
     except Exception:
         return 2  # safe default
+
+
+# ---------------------------------------------------------------------------
+# Open Interest — contrarian signal for liquidation cascades
+# ---------------------------------------------------------------------------
+
+@retry_api()
+def get_open_interest(symbol: str) -> dict:
+    """Get current open interest for a symbol (total outstanding contracts)."""
+    exchange = get_exchange()
+    try:
+        # CCXT v4+ method
+        oi = exchange.fetch_open_interest(symbol)
+        return {
+            "symbol": symbol,
+            "open_interest": float(oi.get("openInterestAmount", 0) or 0),
+            "open_interest_value": float(oi.get("openInterestValue", 0) or 0),
+            "timestamp": oi.get("timestamp"),
+        }
+    except (AttributeError, ccxt.NotSupported):
+        # Fallback: try direct Binance API
+        try:
+            base = symbol.split("/")[0] + "USDT"
+            import urllib.request
+            req = urllib.request.Request(
+                f"https://fapi.binance.com/fapi/v1/openInterest?symbol={base}"
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            return {
+                "symbol": symbol,
+                "open_interest": float(data.get("openInterest", 0)),
+                "open_interest_value": 0,
+                "timestamp": data.get("time"),
+            }
+        except Exception:
+            return {"symbol": symbol, "open_interest": 0, "open_interest_value": 0}
+    except Exception:
+        return {"symbol": symbol, "open_interest": 0, "open_interest_value": 0}
+
+
+@retry_api()
+def get_long_short_ratio(symbol: str) -> dict:
+    """Get top trader long/short ratio (Binance-specific)."""
+    try:
+        base = symbol.split("/")[0] + "USDT"
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={base}&period=1h&limit=1"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if data:
+            entry = data[0]
+            return {
+                "symbol": symbol,
+                "long_account": float(entry.get("longAccount", 0.5)),
+                "short_account": float(entry.get("shortAccount", 0.5)),
+                "long_short_ratio": float(entry.get("longShortRatio", 1.0)),
+                "timestamp": entry.get("timestamp"),
+            }
+    except Exception:
+        pass
+    return {"symbol": symbol, "long_account": 0.5, "short_account": 0.5, "long_short_ratio": 1.0}
+
+
+@retry_api()
+def get_recent_liquidations(symbol: str, limit: int = 20) -> list[dict]:
+    """Get recent forced liquidation orders for a symbol (Binance-specific).
+
+    Liquidation cascades are price magnets — heavy liquidations in one direction
+    signal potential reversal or continuation depending on context.
+    """
+    try:
+        base = symbol.split("/")[0] + "USDT"
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://fapi.binance.com/fapi/v1/allForceOrders?symbol={base}&limit={limit}"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        return [
+            {
+                "symbol": symbol,
+                "side": entry.get("side", "").lower(),
+                "qty": float(entry.get("origQty", 0)),
+                "price": float(entry.get("price", 0)),
+                "time": entry.get("time"),
+            }
+            for entry in data
+        ]
+    except Exception:
+        return []

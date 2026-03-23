@@ -1,16 +1,5 @@
 {
   "mcpServers": {
-    "binance-futures": {
-      "command": "uv",
-      "args": [
-        "--directory", "mcp-servers/mcp-binance-futures",
-        "run", "mcp-binance-futures"
-      ],
-      "env": {
-        "BINANCE_API_KEY": "${BINANCE_KEY_API}",
-        "BINANCE_API_SECRET": "${BINANCE_KEY_SECRET}"
-      }
-    },
     "fear-greed": {
       "command": "uv",
       "args": [

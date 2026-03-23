@@ -156,32 +156,40 @@ def volume_ratio(volume: pd.Series | pd.DataFrame, period: int = 20) -> pd.Serie
 def funding_rate_signal(funding_rate: float) -> dict:
     """Score based on perpetual futures funding rate.
 
-    Negative funding (shorts paying longs) → long bias.
-    Positive funding (longs paying shorts) → short bias when elevated.
+    Negative funding (shorts paying longs) → long bias (you get PAID to be long).
+    Positive funding (longs paying shorts) → short bias (you get PAID to be short).
 
+    Enhanced scoring: funding is free money — weight it heavily.
     Returns dict with long_score and short_score contributions.
     """
     long_adj = 0
     short_adj = 0
 
     if funding_rate < -0.05:
-        # Extreme negative — strong long signal
-        long_adj += 3
-    elif funding_rate < 0:
-        # Negative — moderate long bias
+        # Extreme negative — very strong long signal + funding income
+        long_adj += 5
+    elif funding_rate < -0.03:
+        # Strong negative — strong long signal
+        long_adj += 4
+    elif funding_rate < -0.01:
+        # Moderate negative — long bias
         long_adj += 2
 
-    if funding_rate > 0.1:
-        # Extreme positive — strong short signal
-        short_adj += 3
+    if funding_rate > 0.08:
+        # Extreme positive — very strong short signal + funding income
+        short_adj += 5
     elif funding_rate > 0.05:
-        # Very positive — moderate short bias
+        # Strong positive — strong short signal
+        short_adj += 4
+    elif funding_rate > 0.02:
+        # Moderate positive — short bias
         short_adj += 2
 
     return {
         "funding_rate": funding_rate,
         "long_score": long_adj,
         "short_score": short_adj,
+        "funding_edge": "LONG_PAID" if funding_rate < -0.01 else ("SHORT_PAID" if funding_rate > 0.02 else "NEUTRAL"),
     }
 
 
@@ -377,21 +385,21 @@ def bollinger_squeeze(
 def suggest_leverage(
     atr_pct: float | None,
     sl_atr_mult: float = 2.0,
-    safety_factor: float = 0.5,
+    safety_factor: float = 0.7,
     max_leverage: int = 20,
-    min_leverage: int = 3,
+    min_leverage: int = 7,
 ) -> int:
     """Calculate max safe leverage from volatility.
 
     Constraint: liquidation must be FURTHER than SL.
     Formula: leverage = safety_factor / (atr_pct x sl_atr_mult)
 
-    safety_factor 0.5 = 50% buffer between SL and liquidation.
+    safety_factor 0.7 = 30% buffer between SL and liquidation (aggressive).
 
-    ATR 1% → 20x (cap) | ATR 2% → 12x | ATR 3% → 8x | ATR 5% → 5x
+    ATR 1% → 20x (cap) | ATR 2% → 17x | ATR 3% → 11x | ATR 5% → 7x
     """
     if not atr_pct or atr_pct <= 0:
-        return 5
+        return 10
     sl_pct = atr_pct * sl_atr_mult
     optimal = safety_factor / sl_pct
     return max(min_leverage, min(max_leverage, round(optimal)))
@@ -431,13 +439,13 @@ _SIGNAL_WEIGHTS = {
     "macd_hist":     (+2, -2),
     "macd_cross":    (+3, -3),
     "rsi_zone":      (+1, -1),
-    "bollinger":     (+1, -2),
+    "bollinger":     (+2, -3),   # boosted: Bollinger signals are high-quality
     "volume":        (+2, -1),
     "price_sma200":  (+2, -2),
 }
 
-_MAX_RAW = 27   # 16 base + 5 independent + 3 funding + 3 ADX trend boost
-_MIN_RAW = -21   # -16 base - 3 funding - 2 ADX ranging dampen
+_MAX_RAW = 36   # Realistic max (not all signals fire simultaneously): 17 base + 5 independent + 2 momentum + 5 funding + 3 ADX + 3 squeeze + 1 VWAP. Lowered from 43 to spread scores wider.
+_MIN_RAW = -20   # Realistic min: -17 base - 1 ADX ranging - 1 VWAP - 1 misc. Raised from -24.
 
 
 def _score_to_metrics(raw: int) -> dict:
@@ -445,11 +453,11 @@ def _score_to_metrics(raw: int) -> dict:
     normalized = round((raw - _MIN_RAW) / (_MAX_RAW - _MIN_RAW) * 100)
     normalized = max(0, min(100, normalized))
 
-    if normalized >= 70:
+    if normalized >= 65:
         strength = "strong"
-    elif normalized >= 55:
+    elif normalized >= 50:
         strength = "moderate"
-    elif normalized >= 45:
+    elif normalized >= 40:
         strength = "neutral"
     else:
         strength = "weak"
@@ -506,6 +514,7 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
     bb = bollinger_bands(close)
     atr_val = atr(high, low, close)
     vol_r = volume_ratio(vol)
+    vwap_val = vwap(high, low, close, vol)
 
     last = len(close) - 1
     price = close.iloc[last]
@@ -528,10 +537,10 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
     long_raw += _SIGNAL_WEIGHTS["ema_trend"][0 if ema_bullish else 1]
     short_raw += _SIGNAL_WEIGHTS["ema_trend"][1 if ema_bullish else 0]
 
-    # EMA crossover (within last 5 bars)
+    # EMA crossover (within last 10 bars — wider window for more signals)
     ml = macd_df["macd_line"]
     sl = macd_df["signal_line"]
-    for i in range(max(last - 5, 1), last + 1):
+    for i in range(max(last - 10, 1), last + 1):
         if ema20.iloc[i] > ema50.iloc[i] and ema20.iloc[i - 1] <= ema50.iloc[i - 1]:
             long_raw += _SIGNAL_WEIGHTS["ema_crossover"][0]
             short_raw += _SIGNAL_WEIGHTS["ema_crossover"][1]
@@ -551,8 +560,8 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
         long_raw += _SIGNAL_WEIGHTS["macd_hist"][1]
         short_raw += _SIGNAL_WEIGHTS["macd_hist"][0]
 
-    # MACD crossover (last 3 bars)
-    for i in range(max(last - 3, 1), last + 1):
+    # MACD crossover (last 6 bars — wider window for more signals)
+    for i in range(max(last - 6, 1), last + 1):
         if ml.iloc[i] > sl.iloc[i] and ml.iloc[i - 1] <= sl.iloc[i - 1]:
             long_raw += _SIGNAL_WEIGHTS["macd_cross"][0]
             short_raw += _SIGNAL_WEIGHTS["macd_cross"][1]
@@ -654,6 +663,15 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
         long_raw += funding_info["long_score"]
         short_raw += funding_info["short_score"]
 
+    # --- MOMENTUM SIGNAL: recent price action ---
+    # Strong directional move in last 6 candles = trend confirmation
+    if last >= 6 and not pd.isna(close.iloc[last - 6]):
+        move_pct = (close.iloc[last] - close.iloc[last - 6]) / close.iloc[last - 6] * 100
+        if move_pct > 2.0:
+            long_raw += 2   # strong upward momentum
+        elif move_pct < -2.0:
+            short_raw += 2  # strong downward momentum
+
     # --- ADX REGIME SCORING ---
     adx_data = compute_adx(high, low, close)
     adx_last = _safe(adx_data["adx"].iloc[last])
@@ -661,19 +679,35 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
     minus_di_last = _safe(adx_data["minus_di"].iloc[last])
 
     if adx_last is not None:
-        if adx_last > 40 and plus_di_last is not None and minus_di_last is not None:
-            # Strong trend — boost dominant direction
+        if adx_last > 30 and plus_di_last is not None and minus_di_last is not None:
+            # Trending — boost dominant direction (lowered from 40 to 30)
             if plus_di_last > minus_di_last:
                 long_raw += 3
             else:
                 short_raw += 3
         elif adx_last < 20:
-            # Ranging — dampen both (fewer, lower-quality trades)
-            long_raw -= 2
-            short_raw -= 2
+            # Ranging — light dampen only (was -2, now -1)
+            long_raw -= 1
+            short_raw -= 1
+
+    # --- VWAP: institutional mean-reversion anchor ---
+    vwap_last = _safe(vwap_val.iloc[last]) if not pd.isna(vwap_val.iloc[last]) else None
+    if vwap_last is not None and price > 0:
+        vwap_dist_pct = (price - vwap_last) / vwap_last * 100
+        if vwap_dist_pct < -1.0:
+            long_raw += 1    # below VWAP = accumulation zone
+        elif vwap_dist_pct > 1.0:
+            short_raw += 1   # above VWAP = distribution zone
 
     regime = classify_regime(adx_last)
     squeeze = bollinger_squeeze(close)
+
+    # --- SQUEEZE BONUS: imminent breakout boosts BOTH directions ---
+    # Squeeze = low bandwidth = coiled spring. Breakout direction unknown
+    # but the MOVE will be large → higher R/R for whoever catches it.
+    if squeeze.get("is_squeeze"):
+        long_raw += 3
+        short_raw += 3
 
     long_m = _score_to_metrics(long_raw)
     short_m = _score_to_metrics(short_raw)
@@ -688,38 +722,44 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
     pivots = find_pivots(high, low, lookback=5)
     levels = find_nearest_levels(price, pivots)
     adr_val = adr(high, low)
-    adr_last = _r(adr_val.iloc[last]) if not pd.isna(adr_val.iloc[last]) else None
-    atr_last = _r(atr_val.iloc[last])
+    adr_last = _r(adr_val.iloc[last], 6) if not pd.isna(adr_val.iloc[last]) else None
+    atr_last = _r(atr_val.iloc[last], 6)
 
     # Compute suggested SL/TP — ATR-based (primary) with pivot adjustment
-    # Research: 2x ATR SL, 4x ATR TP = 2.0 R/R minimum
+    # Research: 2x ATR SL, 3x ATR TP = 1.5 R/R minimum (tighter TP captures more wins)
     sl_tp = {}
     atr_pct = atr_last / price if price > 0 and atr_last else None
     if atr_last and price > 0:
         sl_mult = 2.0   # 2x ATR stop-loss (consensus for crypto)
-        tp_mult = 4.0   # 4x ATR take-profit (2.0 R/R minimum)
+        tp_mult = 3.0   # 3x ATR take-profit (1.5 R/R minimum) — reduced from 4x: most wins close below 4x ATR
+
+        # Dynamic precision based on price magnitude (fixes low-price tokens)
+        import math
+        _prec = max(2, -int(math.floor(math.log10(max(price, 1e-10)))) + 2)
+        def _rp(v):
+            return round(v, _prec)
 
         # LONG — ATR-based with pivot structure adjustment
-        long_sl = round(price - sl_mult * atr_last, 2)
-        long_tp = round(price + tp_mult * atr_last, 2)
+        long_sl = _rp(price - sl_mult * atr_last)
+        long_tp = _rp(price + tp_mult * atr_last)
         # Tighten SL to support if nearby (within 1 ATR)
         if levels["support_1"] and abs(levels["support_1"] - long_sl) < atr_last:
-            long_sl = round(min(long_sl, levels["support_1"]), 2)
+            long_sl = _rp(min(long_sl, levels["support_1"]))
         # Extend TP to resistance if further (let winners run)
         if levels["resistance_1"] and levels["resistance_1"] > long_tp:
-            long_tp = round(levels["resistance_1"], 2)
+            long_tp = _rp(levels["resistance_1"])
 
         long_sl_pct = round((long_sl - price) / price * 100, 2)
         long_tp_pct = round((long_tp - price) / price * 100, 2)
         long_rr = round(abs(long_tp_pct / long_sl_pct), 2) if long_sl_pct != 0 else 0
 
         # SHORT — ATR-based with pivot structure adjustment
-        short_sl = round(price + sl_mult * atr_last, 2)
-        short_tp = round(price - tp_mult * atr_last, 2)
+        short_sl = _rp(price + sl_mult * atr_last)
+        short_tp = _rp(price - tp_mult * atr_last)
         if levels["resistance_1"] and abs(levels["resistance_1"] - short_sl) < atr_last:
-            short_sl = round(max(short_sl, levels["resistance_1"]), 2)
+            short_sl = _rp(max(short_sl, levels["resistance_1"]))
         if levels["support_1"] and levels["support_1"] < short_tp:
-            short_tp = round(levels["support_1"], 2)
+            short_tp = _rp(levels["support_1"])
 
         short_sl_pct = round((short_sl - price) / price * 100, 2)
         short_tp_pct = round((short_tp - price) / price * 100, 2)
@@ -754,6 +794,7 @@ def compute_signals(df: pd.DataFrame, *, funding_rate: float | None = None) -> d
             "adr14": adr_last,
             "volume_ratio": _r(vr),
             "sma200": _r(sma200_val) if sma200_val is not None else None,
+            "vwap": _r(vwap_last) if vwap_last is not None else None,
             "adx": _r(adx_last, 1),
             "plus_di": _r(plus_di_last, 1),
             "minus_di": _r(minus_di_last, 1),
@@ -869,3 +910,252 @@ def compute_multi_timeframe(
             tf: _MTF_WEIGHTS.get(tf, 1.0) for tf in timeframes
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Kelly criterion — category-aware position sizing
+# ---------------------------------------------------------------------------
+
+# Historical win rates and payoff ratios per category (from evolve reports).
+# Updated after each /evolve analysis. Half-Kelly for safety.
+_CATEGORY_EDGE: dict[str, dict] = {
+    "AI":               {"win_rate": 0.56, "payoff": 3.1, "risk_pct": 0.08},  # 83% of profits — overweight
+    "Smart Contract L1": {"win_rate": 0.45, "payoff": 1.5, "risk_pct": 0.04},
+    "Store of Value":   {"win_rate": 0.50, "payoff": 2.0, "risk_pct": 0.05},
+    "Layer 2":          {"win_rate": 0.40, "payoff": 1.3, "risk_pct": 0.03},
+    "DeFi":             {"win_rate": 0.42, "payoff": 1.4, "risk_pct": 0.03},
+    "Meme":             {"win_rate": 0.38, "payoff": 2.5, "risk_pct": 0.03},  # high payoff but low WR
+    "Exchange Token":   {"win_rate": 0.40, "payoff": 1.2, "risk_pct": 0.02},
+    "Payment":          {"win_rate": 0.38, "payoff": 1.2, "risk_pct": 0.02},
+    "Gaming":           {"win_rate": 0.35, "payoff": 1.5, "risk_pct": 0.02},
+    "Infrastructure":   {"win_rate": 0.40, "payoff": 1.3, "risk_pct": 0.03},
+    "Staking":          {"win_rate": 0.40, "payoff": 1.3, "risk_pct": 0.03},
+    "Other":            {"win_rate": 0.40, "payoff": 1.3, "risk_pct": 0.03},
+}
+
+
+def kelly_risk_pct(category: str) -> float:
+    """Return the Half-Kelly risk percentage for a given category.
+
+    Uses historical win_rate and payoff ratio to compute optimal bet size.
+    Formula: Kelly% = (win_rate * payoff - (1 - win_rate)) / payoff
+    Half-Kelly = Kelly% / 2 (conservative, reduces variance).
+
+    Returns risk as a fraction (e.g. 0.08 = 8% of equity).
+    """
+    edge = _CATEGORY_EDGE.get(category, _CATEGORY_EDGE["Other"])
+    w = edge["win_rate"]
+    b = edge["payoff"]
+
+    kelly = (w * b - (1 - w)) / b if b > 0 else 0
+    half_kelly = max(0.01, kelly / 2)  # floor at 1%
+
+    # Cap at the pre-defined risk_pct (which is already Half-Kelly-calibrated)
+    return min(half_kelly, edge["risk_pct"])
+
+
+# ---------------------------------------------------------------------------
+# Open Interest signal — contrarian indicator
+# ---------------------------------------------------------------------------
+
+def open_interest_signal(oi_change_pct: float, price_change_pct: float) -> dict:
+    """Score based on open interest change vs price change.
+
+    OI rising + price rising = new longs entering → trend continuation (long bias)
+    OI rising + price falling = new shorts entering → trend continuation (short bias)
+    OI falling + price rising = short squeeze → long bias (but exhaustion warning)
+    OI falling + price falling = long liquidation → short bias (but exhaustion warning)
+
+    Returns dict with long_score and short_score contributions.
+    """
+    long_adj = 0
+    short_adj = 0
+
+    if oi_change_pct > 5:  # Significant OI increase
+        if price_change_pct > 1:
+            long_adj += 2   # New money entering long — continuation
+        elif price_change_pct < -1:
+            short_adj += 2  # New money entering short — continuation
+    elif oi_change_pct < -5:  # Significant OI decrease
+        if price_change_pct > 2:
+            long_adj += 1   # Short squeeze — bullish but caution
+        elif price_change_pct < -2:
+            short_adj += 1  # Long liquidation cascade — bearish but caution
+
+    return {
+        "oi_change_pct": oi_change_pct,
+        "price_change_pct": price_change_pct,
+        "long_score": long_adj,
+        "short_score": short_adj,
+    }
+
+
+# ---------------------------------------------------------------------------
+# VWAP — Volume Weighted Average Price (institutional anchor)
+# ---------------------------------------------------------------------------
+
+def vwap(
+    high: pd.Series | pd.DataFrame,
+    low: pd.Series | pd.DataFrame,
+    close: pd.Series | pd.DataFrame,
+    volume: pd.Series | pd.DataFrame,
+    period: int = 20,
+) -> pd.Series:
+    """Rolling VWAP over *period* bars.
+
+    In 24/7 crypto (no daily reset), use rolling window.
+    Price below VWAP = accumulation zone (institutional buying).
+    Price above VWAP = distribution zone (institutional selling).
+    """
+    h = _ensure_series(high, "high")
+    l = _ensure_series(low, "low")
+    c = _ensure_series(close, "close")
+    v = _ensure_series(volume, "volume")
+
+    typical = (h + l + c) / 3
+    cum_tp_vol = (typical * v).rolling(window=period, min_periods=period).sum()
+    cum_vol = v.rolling(window=period, min_periods=period).sum()
+    return cum_tp_vol / cum_vol.replace(0, np.nan)
+
+
+# ---------------------------------------------------------------------------
+# Time-of-day adjustment — proven by trade data
+# ---------------------------------------------------------------------------
+
+def time_of_day_adjustment() -> dict:
+    """Returns score adjustment and size multiplier based on UTC hour.
+
+    From evolve report 2026-03-22:
+    - 02:00-09:00 UTC: ALL profitable trades > $10 happened here
+    - 12:00-18:00 UTC: 6-loss cluster
+
+    Returns dict with score_adj (added to raw), size_mult, and window name.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    hour = _dt.now(_tz.utc).hour
+
+    if 2 <= hour <= 9:
+        return {"score_adj": 3, "size_mult": 1.25, "window": "GOLDEN_HOURS",
+                "note": "02-09 UTC: historically most profitable window"}
+    elif 12 <= hour <= 18:
+        return {"score_adj": -3, "size_mult": 0.75, "window": "CAUTION_HOURS",
+                "note": "12-18 UTC: historically loss cluster"}
+    return {"score_adj": 0, "size_mult": 1.0, "window": "STANDARD", "note": ""}
+
+
+# ---------------------------------------------------------------------------
+# Dynamic score threshold — adapts to recent performance
+# ---------------------------------------------------------------------------
+
+def dynamic_score_threshold(closed_trades: list, base_threshold: int = 55) -> dict:
+    """Adjust score threshold based on recent win rate.
+
+    Hot streak (WR > 55%) → lower threshold, more trades (momentum)
+    Cold streak (WR < 35%) → slightly higher threshold (but CAPPED at 58)
+
+    CRITICAL: max threshold = 58. Scores rarely exceed 63. A threshold of 65+
+    creates a death spiral: no trades → no wins → threshold stays high.
+    Data from 34 cycles showed threshold=65 blocked ALL trades for 4 hours.
+
+    Returns dict with threshold and reasoning.
+    """
+    if len(closed_trades) < 10:
+        return {"threshold": base_threshold, "high_threshold": 60,
+                "reason": "insufficient data (<10 trades)", "win_rate": None}
+
+    recent = closed_trades[-20:]
+    wins = sum(1 for t in recent if t.get("pnl_pct", 0) > 0 or t.get("unrealized_pnl", 0) > 0)
+    win_rate = round(wins / len(recent) * 100, 1)
+
+    if win_rate > 55:
+        threshold = max(48, base_threshold - 7)
+        high_threshold = 58
+        reason = f"HOT: {win_rate}% WR → aggressive (threshold {threshold})"
+    elif win_rate < 35:
+        threshold = min(58, base_threshold + 3)
+        high_threshold = 62
+        reason = f"COLD: {win_rate}% WR → slightly selective (threshold {threshold})"
+    else:
+        threshold = base_threshold
+        high_threshold = 60
+        reason = f"NORMAL: {win_rate}% WR → standard"
+
+    return {"threshold": threshold, "high_threshold": high_threshold,
+            "reason": reason, "win_rate": win_rate}
+
+
+# ---------------------------------------------------------------------------
+# Liquidation signal — liquidation cascades are price magnets
+# ---------------------------------------------------------------------------
+
+def liquidation_signal(recent_liquidations: list) -> dict:
+    """Score based on recent forced liquidation data.
+
+    Heavy long liquidations = panic selling → short-term bounce potential (long)
+    Heavy short liquidations = short squeeze → more upside (long continuation)
+
+    recent_liquidations: list of dicts with 'side' and 'qty' keys.
+    """
+    if not recent_liquidations:
+        return {"long_score": 0, "short_score": 0, "long_liq_volume": 0, "short_liq_volume": 0}
+
+    long_liq = sum(l.get("qty", 0) for l in recent_liquidations if l.get("side") == "sell")
+    short_liq = sum(l.get("qty", 0) for l in recent_liquidations if l.get("side") == "buy")
+
+    long_adj = 0
+    short_adj = 0
+
+    # Heavy long liquidations = capitulation → contrarian long signal
+    if long_liq > short_liq * 3 and long_liq > 0:
+        long_adj += 2
+    # Heavy short liquidations = squeeze → continuation long signal
+    elif short_liq > long_liq * 3 and short_liq > 0:
+        long_adj += 1
+    # Heavy short liq without continuation = reversal short signal
+    if short_liq > long_liq * 5 and short_liq > 0:
+        short_adj += 1
+
+    return {
+        "long_score": long_adj,
+        "short_score": short_adj,
+        "long_liq_volume": round(long_liq, 2),
+        "short_liq_volume": round(short_liq, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Suggested limit entry — better fills than market
+# ---------------------------------------------------------------------------
+
+def suggest_limit_entry(
+    price: float,
+    atr_last: float,
+    vwap_last: float | None,
+    support_1: float | None,
+    resistance_1: float | None,
+    direction: str,
+) -> float | None:
+    """Suggest a limit entry price for better fills.
+
+    LONG: enter at best of (VWAP, support_1, price - 0.3*ATR)
+    SHORT: enter at best of (VWAP, resistance_1, price + 0.3*ATR)
+    Returns None if no good level found (use market).
+    """
+    if not atr_last or price <= 0:
+        return None
+
+    if direction == "LONG":
+        candidates = [price - 0.3 * atr_last]  # slight pullback from current
+        if vwap_last and vwap_last < price and vwap_last > price - atr_last:
+            candidates.append(vwap_last)
+        if support_1 and support_1 < price and support_1 > price - atr_last:
+            candidates.append(support_1)
+        # Best entry = highest of the candidates (closest to current price but still below)
+        return round(max(candidates), 6) if candidates else None
+    else:  # SHORT
+        candidates = [price + 0.3 * atr_last]
+        if vwap_last and vwap_last > price and vwap_last < price + atr_last:
+            candidates.append(vwap_last)
+        if resistance_1 and resistance_1 > price and resistance_1 < price + atr_last:
+            candidates.append(resistance_1)
+        return round(min(candidates), 6) if candidates else None

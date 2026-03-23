@@ -41,18 +41,21 @@ CATEGORY_MAP: dict[str, str] = {
     "SUSHI": "DeFi", "1INCH": "DeFi", "JUP": "DeFi",
     "PENDLE": "DeFi", "ENA": "DeFi", "PYTH": "DeFi",
     "W": "DeFi", "JTO": "DeFi", "RAY": "DeFi",
+    "SIREN": "DeFi", "QUICK": "DeFi",
 
     # Meme
     "DOGE": "Meme", "SHIB": "Meme", "PEPE": "Meme",
     "WIF": "Meme", "BONK": "Meme", "FLOKI": "Meme",
     "MEME": "Meme", "PEOPLE": "Meme", "TURBO": "Meme",
     "BRETT": "Meme", "NEIRO": "Meme", "BOME": "Meme",
+    "MYRO": "Meme", "1000X": "Meme", "CUDIS": "Meme",
 
     # AI / Compute
     "RENDER": "AI", "FET": "AI", "AGIX": "AI",
     "OCEAN": "AI", "AKT": "AI", "TAO": "AI",
     "WLD": "AI", "ARKM": "AI", "RNDR": "AI",
-    "AR": "AI",
+    "AR": "AI", "VIRTUAL": "AI", "AI16Z": "AI",
+    "GRIFFAIN": "AI", "COOKIE": "AI",
 
     # Payment / Transfer
     "XRP": "Payment", "XLM": "Payment", "LTC": "Payment",
@@ -62,12 +65,16 @@ CATEGORY_MAP: dict[str, str] = {
     # Gaming / Metaverse
     "AXS": "Gaming", "GALA": "Gaming", "SAND": "Gaming",
     "MANA": "Gaming", "ENJ": "Gaming", "PIXEL": "Gaming",
-    "RONIN": "Gaming", "YGG": "Gaming",
+    "RONIN": "Gaming", "YGG": "Gaming", "VOXEL": "Gaming",
 
     # Infrastructure / Storage
     "FIL": "Infrastructure", "GRT": "Infrastructure",
     "STX": "Infrastructure", "THETA": "Infrastructure",
     "ROSE": "Infrastructure", "ONDO": "Infrastructure",
+    "TOKEN": "Infrastructure",
+
+    # Misc tokens frequently scanned on Binance Futures
+    "BR": "DeFi", "ARIA": "AI", "JCT": "Infrastructure",
 
     # Staking / Liquid Staking
     "EIGEN": "Staking", "ETHFI": "Staking",
